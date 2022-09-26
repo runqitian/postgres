@@ -31,6 +31,11 @@ REGRESS = test_ddl_deparse \
 
 EXTRA_INSTALL = contrib/pg_stat_statements
 
+REGRESS_SHLIB=$(abs_top_builddir)/src/test/regress/regress$(DLSUFFIX)
+export REGRESS_SHLIB
+
+TAP_TESTS = 1
+
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
