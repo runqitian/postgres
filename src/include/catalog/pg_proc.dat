@@ -11838,4 +11838,7 @@
 { oid => '4647', descr => 'trigger for ddl command deparse table init',
   proname => 'publication_deparse_table_init_write', prorettype => 'event_trigger',
   proargtypes => '', prosrc => 'publication_deparse_table_init_write' },
+{ oid => '4648', descr => 'deparse the DDL command into json format string',
+  proname => 'deparse_drop_object', prorettype => 'text',
+  proargtypes => 'text text', prosrc => 'deparse_drop_object' },
 ]

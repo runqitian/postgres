@@ -17,6 +17,9 @@ EXTRA_INSTALL = contrib/hstore
 
 export with_icu
 
+REGRESS_SHLIB=$(abs_top_builddir)/src/test/regress/regress$(DLSUFFIX)
+export REGRESS_SHLIB
+
 check:
 	$(prove_check)
 

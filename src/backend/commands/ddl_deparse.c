@@ -5838,6 +5838,43 @@ deparse_DefElem(DefElem *elem, bool is_reset)
 	return set;
 }
 
+
+/*
+ * Handle deparsing of DROP commands.
+ */
+Datum
+deparse_drop_object(PG_FUNCTION_ARGS)
+{
+	text	   *objidentity = PG_GETARG_TEXT_P(0);
+	char	   *objidentity_str = TextDatumGetCString(objidentity);
+	text	   *objecttype = PG_GETARG_TEXT_P(1);
+	char	   *objecttype_str = TextDatumGetCString(objecttype);
+
+	char		   *command;
+
+	// constraint is part of alter table command, no need to drop in DROP command
+	if (strcmp(objecttype_str, "table constraint") == 0) {
+		PG_RETURN_NULL();
+	} else if (strcmp(objecttype_str, "toast table") == 0) {
+		objecttype_str = "table";
+	}  else if (strcmp(objecttype_str, "default value") == 0) {
+		PG_RETURN_NULL();
+	} else if (strcmp(objecttype_str, "operator of access method") == 0) {
+		PG_RETURN_NULL();
+	} else if (strcmp(objecttype_str, "function of access method") == 0) {
+		PG_RETURN_NULL();
+	} else if (strcmp(objecttype_str, "table column") == 0) {
+		PG_RETURN_NULL();
+	}
+
+	command = deparse_drop_command(objidentity_str, objecttype_str, DROP_CASCADE);
+
+	if (command)
+		PG_RETURN_TEXT_P(CStringGetTextDatum(command));
+
+	PG_RETURN_NULL();
+}
+
 /*
  * Handle deparsing of DROP commands.
  */
