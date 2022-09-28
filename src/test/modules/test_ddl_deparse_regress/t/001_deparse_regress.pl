@@ -10,19 +10,22 @@ sub execute_regress_test {
     my $test_name = $_[0];
     my $dbname = "postgres";
     my $dlpath    = dirname($ENV{REGRESS_SHLIB});
-    my $inputdir = ".";
+    # my $inputdir = ".";
     # I copied create_table.sql and comment the failed test case line 62-63, to show how this testing framework works
     # Change $inputdir to regres folder after deparser issue is fixed
-    # my $inputdir = "../../regress";
+    my $inputdir = "../../regress";
     my $outputdir = $PostgreSQL::Test::Utils::tmp_check;
+
+    # Create and start pub sub nodes
     my $pub_node = init_pub_node($test_name);
     my $sub_node = init_sub_node($test_name);
-
     $pub_node -> start;
     $sub_node -> start;
 
+    # Set up deparse testing resources
     create_deparse_testing_resources_on_pub_node($pub_node, $dbname);
 
+    # Execute regression test for $test_name on pub node
     my $rc = system($ENV{PG_REGRESS}
         . " "
         . "--dlpath=\"$dlpath\" "
@@ -38,7 +41,7 @@ sub execute_regress_test {
         . $test_name);
     if ($rc != 0)
     {
-        # Dump out the regression diffs file, if there is one
+        # If regression test fails, dump out the regression diffs file
         my $diffs = "${outputdir}/regression/${test_name}.diffs";
         if (-e $diffs)
         {
@@ -46,39 +49,46 @@ sub execute_regress_test {
             print slurp_file($diffs);
             print "=== EOF ===\n";
         }
+        exit $rc;
     }
-    is($rc, 0, "Execute regression test for ${test_name}");
 
-    # Retrieve the deparsed DDLs.
+    # Retrieve SQL commands generated from deparsed DDLs on pub node
     my $ddl_sql = '';
-    is($pub_node -> psql(
-        'postgres',
-        q(select ddl_deparse_expand_command(ddl) || ';' from deparsed_ddls ORDER BY id ASC),
-        stdout => \$ddl_sql), 0, 'Retrieve deparsed DDLs from pub node');
+    $pub_node -> psql($dbname,q(
+        select ddl_deparse_expand_command(ddl) || ';' from deparsed_ddls ORDER BY id ASC),
+        stdout => \$ddl_sql);
     
-    $sub_node -> safe_psql('postgres', $ddl_sql);
+    # Execute SQL commands on sub node
+    $sub_node -> psql($dbname, $ddl_sql);
 
+    # Clean up deparse testing resources
     clean_deparse_testing_resources_on_pub_node($pub_node, $dbname);
 
+    # Dump from pub node and sub node
     mkdir ${outputdir}."/dumps", 0755;
     my $pub_dump = ${outputdir}."/dumps/${test_name}_pub.dump";
     my $sub_dump = ${outputdir}."/dumps/${test_name}_sub.dump";
-    command_ok(
-        [
-            'pg_dumpall', '-s', '-f', $pub_dump,
-            '--no-sync', '-p', $pub_node->port
-        ],
-        'dump pub server');
-    command_ok(
-        [
-            'pg_dumpall', '-s', '-f', $sub_dump,
-            '--no-sync', '-p', $sub_node->port
-        ],
-        'dump sub server');
+    system("pg_dumpall "
+        . "-s "
+        . "-f "
+        . $pub_dump . " "
+        . "--no-sync "
+        .  '-p '
+        . $pub_node->port);
+    system("pg_dumpall "
+        . "-s "
+        . "-f "
+        . $sub_dump . " "
+        . "--no-sync "
+        .  '-p '
+        . $sub_node->port);
+
+    # Compare dumped results
     command_ok(
         ['diff', $pub_dump, $sub_dump],
         'compare pub and sub dumps');
 
+    # Close nodes
     $pub_node->stop;
     $sub_node->stop;
 }
@@ -107,7 +117,7 @@ sub init_sub_node {
 sub create_deparse_testing_resources_on_pub_node {
     my $node = $_[0];
     my $dbname = $_[1];
-    is($node -> psql($dbname, q(
+    $node -> psql($dbname, q(
         begin;
         create table deparsed_ddls(id SERIAL PRIMARY KEY, tag text, object_identity text, ddl text);
 
@@ -144,7 +154,7 @@ sub create_deparse_testing_resources_on_pub_node {
         on sql_drop execute procedure deparse_drops_to_json();
 
         commit;
-    )), 0, "Set up pub node for deparse testing");
+    ));
 }
 
 sub clean_deparse_testing_resources_on_pub_node {
