@@ -1,0 +1,30 @@
+#-------------------------------------------------------------------------
+#
+# Makefile for src/test/modules/test_ddl_deparse_regress
+#
+# Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+# Portions Copyright (c) 1994, Regents of the University of California
+#
+# src/test/modules/test_ddl_deparse_regress/Makefile
+#
+#-------------------------------------------------------------------------
+
+subdir = src/test/modules/test_deparser
+top_builddir = ../../../..
+include $(top_builddir)/src/Makefile.global
+
+EXTRA_INSTALL = contrib/hstore
+
+export with_icu
+
+REGRESS_SHLIB=$(abs_top_builddir)/src/test/regress/regress$(DLSUFFIX)
+export REGRESS_SHLIB
+
+check:
+	$(prove_check)
+
+installcheck:
+	$(prove_installcheck)
+
+clean distclean maintainer-clean:
+	rm -rf tmp_check

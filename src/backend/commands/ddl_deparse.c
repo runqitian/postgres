@@ -6509,6 +6509,42 @@ deparse_DefElem(DefElem *elem, bool is_reset)
 }
 
 /*
+ * Given object_identity and object_type of dropped object, return a JSON representation of DROP command.
+ */
+Datum
+deparse_drop_ddl(PG_FUNCTION_ARGS)
+{
+	text	   *objidentity = PG_GETARG_TEXT_P(0);
+	const char	   *objidentity_str = text_to_cstring(objidentity);
+	text	   *objecttype = PG_GETARG_TEXT_P(1);
+	const char	   *objecttype_str = text_to_cstring(objecttype);
+
+	char		   *command;
+
+	// constraint is part of alter table command, no need to drop in DROP command
+	if (strcmp(objecttype_str, "table constraint") == 0) {
+		PG_RETURN_NULL();
+	} else if (strcmp(objecttype_str, "toast table") == 0) {
+		objecttype_str = "table";
+	}  else if (strcmp(objecttype_str, "default value") == 0) {
+		PG_RETURN_NULL();
+	} else if (strcmp(objecttype_str, "operator of access method") == 0) {
+		PG_RETURN_NULL();
+	} else if (strcmp(objecttype_str, "function of access method") == 0) {
+		PG_RETURN_NULL();
+	} else if (strcmp(objecttype_str, "table column") == 0) {
+		PG_RETURN_NULL();
+	}
+
+	command = deparse_drop_command(objidentity_str, objecttype_str, DROP_CASCADE);
+
+	if (command)
+		PG_RETURN_TEXT_P(cstring_to_text(command));
+
+	PG_RETURN_NULL();
+}
+
+/*
  * Handle deparsing of DROP commands.
  */
 char *
