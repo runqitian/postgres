@@ -7674,6 +7674,130 @@ deparse_CreateTableAsStmt(CollectedCommand *cmd)
 	return deparse_CreateStmt(objectId, parsetree);
 }
 
+static ObjTree *
+deparse_CreateTableAsStmt_NoTransformation(Oid objectId, Node *parsetree)
+{
+	CreateTableAsStmt *node = (CreateTableAsStmt *) parsetree;
+	Relation	relation = relation_open(objectId, AccessShareLock);
+	ObjTree	   *createStmt;
+	ObjTree	   *tmp;
+	ObjTree	   *tmp2;
+	char	   *fmt;
+	List	   *list;
+	ListCell   *cell;
+
+	/*
+	 * Reject unsupported case right away.
+	 */
+	if (((Query *) (node->query))->commandType == CMD_UTILITY)
+		elog(ERROR, "unimplemented deparse of CREATE TABLE AS EXECUTE");
+
+	/*
+	 * Note that INSERT INTO is deparsed as CREATE TABLE AS.  They are
+	 * functionally equivalent synonyms so there is no harm from this.
+	 * 
+	 * "CREATE %{persistence}s [MATERIALIZED VIEW | TABLE] %{if_not_exists}s "
+			"%{identity}D %{columns}s [%{on_commit}s] %{tablespace}s "
+			"AS %{query}s %{with_no_data}s";
+	 */
+	if (node->objtype == OBJECT_MATVIEW)
+		fmt = "CREATE %{persistence}s MATERIALIZED VIEW %{if_not_exists}s ";
+	else
+		fmt = "CREATE %{persistence}s TABLE %{if_not_exists}s ";
+
+	createStmt =
+		new_objtree_VA(fmt, 2,
+					   "persistence", ObjTypeString,
+					   get_persistence_str(node->into->rel->relpersistence),
+					   "if_not_exists", ObjTypeString,
+					   node->if_not_exists ? "IF NOT EXISTS" : "");
+
+	/* Add identity */ 
+	append_object_object(createStmt, "%{identity}D",
+						 new_objtree_for_qualname_id(RelationRelationId,
+													 objectId));
+
+	/* COLLUMNS clause */
+	if (node->into->colNames == NIL)
+		tmp = new_objtree_VA("", 1,
+							 "present", ObjTypeBool, false);
+	else
+	{
+		ListCell *cell;
+
+		list = NIL;
+		foreach (cell, node->into->colNames)
+			list = lappend(list, new_string_object(strVal(lfirst(cell))));
+
+		tmp = new_objtree_VA("(%{columns:, }I)", 1,
+							 "columns", ObjTypeArray, list);
+	}
+	append_object_object(createStmt, "%{columns}s", tmp);
+
+	/* USING clause */
+	tmp = new_objtree("USING");
+	if (node->into->accessMethod)
+		append_string_object(tmp, "%{access_method}I", node->into->accessMethod);
+	else
+	{
+		append_null_object(tmp, "%{access_method}I");
+		append_bool_object(tmp, "present", false);
+	}
+	append_object_object(createStmt, "%{access_method}s", tmp);
+
+	/* WITH clause */
+	tmp = new_objtree_VA("WITH", 0);
+	list = NIL;
+
+	foreach(cell, node->into->options)
+	{
+		DefElem *opt = (DefElem *) lfirst(cell);
+
+		tmp2 = deparse_DefElem(opt, false);
+		list = lappend(list, new_object_object(tmp2));
+	}
+
+	if (list)
+		append_array_object(tmp, "(%{with:, }s)", list);
+	else
+		append_bool_object(tmp, "present", false);
+
+	append_object_object(createStmt, "%{with_clause}s", tmp);
+
+	/* ON COMMIT clause.  CREATE MATERIALIZED VIEW doesn't have one */
+	if (node->objtype == OBJECT_TABLE)
+	{
+		append_object_object(createStmt, "%{on_commit}s",
+							 deparse_OnCommitClause(node->into->onCommit));
+	}
+
+	/* TABLESPACE clause */
+	tmp = new_objtree_VA("TABLESPACE %{tablespace}I", 0);
+	if (node->into->tableSpaceName)
+		append_string_object(tmp, "%{tablespace}s", node->into->tableSpaceName);
+	else
+	{
+		append_null_object(tmp, "%{tablespace}s");
+		append_bool_object(tmp, "present", false);
+	}
+	append_object_object(createStmt, "%{tablespace}s", tmp);
+
+	/* query clause */
+	Assert(IsA(node->query, Query));
+	append_string_object(createStmt, "AS %{query}s",
+						 pg_get_querydef((Query *) node->query, false));
+
+	/* add a WITH NO DATA clause */
+	tmp = new_objtree_VA("WITH NO DATA", 1,
+						 "present", ObjTypeBool,
+						 node->into->skipData ? true : false);
+	append_object_object(createStmt, "%{with_no_data}s", tmp);
+
+	relation_close(relation, AccessShareLock);
+
+	return createStmt;
+}
+
 
 /*
  * Handle deparsing of simple commands.
@@ -7838,6 +7962,10 @@ deparse_simple_command(CollectedCommand *cmd)
 
 		case T_AlterTSDictionaryStmt:
 			command = deparse_AlterTSDictionaryStmt(objectId, parsetree);
+			break;
+
+		case T_CreateTableAsStmt:
+			command = deparse_CreateTableAsStmt_NoTransformation(objectId, parsetree);
 			break;
 
 		default:

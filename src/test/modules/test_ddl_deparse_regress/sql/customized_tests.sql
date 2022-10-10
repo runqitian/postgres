@@ -1,0 +1,13 @@
+CREATE TABLE origin (
+	id	 int,
+    name varchar(10)
+);
+
+INSERT INTO origin VALUES (1, 'foo');
+
+CREATE TABLE test_simple AS SELECT * FROM origin;
+
+CREATE TABLE test_columns(col1) AS 
+    SELECT name FROM origin;
+
+CREATE TABLE test_with_clause WITH (parallel_workers = 5) AS SELECT * FROM origin;
