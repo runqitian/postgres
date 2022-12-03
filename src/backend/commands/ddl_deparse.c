@@ -1804,6 +1804,9 @@ deparse_GrantStmt(CollectedCommand *cmd)
 
 	istmt = cmd->d.grant.istmt;
 
+
+	
+
 	/*
 	 * If there are no objects from "ALL ... IN SCHEMA" to be granted, then
 	 * we need not do anything.
@@ -2111,6 +2114,10 @@ deparse_AlterOpFamily(CollectedCommand *cmd)
 	Form_pg_opfamily opfForm;
 	List	   *list;
 	ListCell   *cell;
+
+	/* Don't deparse sql commands generated while creating extension */
+	if (cmd->in_extension)
+		return NULL;
 
 	ftp = SearchSysCache1(OPFAMILYOID,
 						  ObjectIdGetDatum(cmd->d.opfam.address.objectId));
@@ -3147,6 +3154,8 @@ deparse_AlterTableStmt(CollectedCommand *cmd)
 	List	   *exprs = NIL;
 
 	Assert(cmd->type == SCT_AlterTable);
+
+	
 
 	rel = relation_open(cmd->d.alterTable.objectId, AccessShareLock);
 	dpcontext = deparse_context_for(RelationGetRelationName(rel),
@@ -8479,4 +8488,10 @@ deparse_utility_command(CollectedCommand *cmd, bool verbose_mode)
 	MemoryContextDelete(tmpcxt);
 
 	return command;
+}
+
+static bool
+skip_deparse_in_extension_stmt() {
+	if (cmd->in_extension)
+		return NULL;
 }
