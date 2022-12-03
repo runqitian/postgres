@@ -389,11 +389,10 @@ ExecuteGrantStmt(GrantStmt *stmt)
 	ListCell   *cell;
 	const char *errormsg;
 	AclMode		all_privileges;
+	Oid			grantor = InvalidOid;
 
 	if (stmt->grantor)
 	{
-		Oid			grantor;
-
 		grantor = get_rolespec_oid(stmt->grantor, false);
 
 		/*
@@ -409,6 +408,7 @@ ExecuteGrantStmt(GrantStmt *stmt)
 	/*
 	 * Turn the regular GrantStmt into the InternalGrant form.
 	 */
+	istmt.grantor_uid = grantor;
 	istmt.is_grant = stmt->is_grant;
 	istmt.objtype = stmt->objtype;
 
