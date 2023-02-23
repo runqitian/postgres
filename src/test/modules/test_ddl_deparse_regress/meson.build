@@ -32,6 +32,8 @@ tests += {
       'create_extension',
       'create_schema',
       'create_table',
+      'aggregate',
+      'create_table_test'
     ],
   },
   'tap': {

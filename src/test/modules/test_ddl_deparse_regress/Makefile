@@ -21,7 +21,8 @@ REGRESS = test_ddl_deparse \
 	create_extension \
 	create_schema \
 	create_table \
-	aggregate
+	aggregate \
+	create_table_test
 
 export REGRESS
 
