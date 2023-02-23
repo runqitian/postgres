@@ -1,0 +1,8 @@
+CREATE AGGREGATE newavg(int4) (
+   sfunc = int4_avg_accum, stype = _int8,
+   finalfunc = int8_avg,
+   initcond1 = '{0,0}'
+);
+NOTICE:  deparsed json: {"fmt": "CREATE AGGREGATE %{identity}D (%{types}s) (%{elems:, }s)", "elems": [{"fmt": "SFUNC=%{procedure}D", "procedure": {"objname": "int4_avg_accum", "schemaname": "pg_catalog"}}, {"fmt": "STYPE=%{type}T", "type": {"typmod": "", "typarray": true, "typename": "int8", "schemaname": "pg_catalog"}}, {"fmt": "SSPACE=", "present": false}, {"fmt": "FINALFUNC= %{procedure}D", "procedure": {"objname": "int8_avg", "schemaname": "pg_catalog"}}, {"fmt": "FINALFUNC_EXTRA=", "present": false}, {"fmt": "INITCOND= %{initval}L", "initval": "{0,0}"}, {"fmt": "MSFUNC=", "present": false}, {"fmt": "MSTYPE=", "present": false}, {"fmt": "MSSPACE=", "present": false}, {"fmt": "MINVFUNC=", "present": false}, {"fmt": "MFINALFUNC=", "present": false}, {"fmt": "MFINALFUNC_EXTRA=", "present": false}, {"fmt": "MINITCOND=", "present": false}, {"fmt": "HYPOTHETICAL=", "present": false}, {"fmt": "SORTOP=", "present": false}], "types": {"fmt": "%{direct:, }s", "direct": [{"fmt": "%{mode}s %{name}s %{type}T", "mode": "", "name": "", "type": {"typmod": "", "typarray": false, "typename": "int4", "schemaname": "pg_catalog"}}]}, "identity": {"objname": "newavg", "schemaname": "public"}}
+NOTICE:  re-formed command: CREATE AGGREGATE public.newavg (  pg_catalog.int4) (SFUNC=pg_catalog.int4_avg_accum, STYPE=pg_catalog.int8[], FINALFUNC= pg_catalog.int8_avg, INITCOND= '{0,0}')
+DROP AGGREGATE newavg(int4);

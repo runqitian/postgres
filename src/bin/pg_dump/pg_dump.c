@@ -51,6 +51,7 @@
 #include "catalog/pg_largeobject_d.h"
 #include "catalog/pg_largeobject_metadata_d.h"
 #include "catalog/pg_proc_d.h"
+#include "catalog/pg_publication.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_trigger_d.h"
 #include "catalog/pg_type_d.h"
@@ -3949,6 +3950,8 @@ getPublications(Archive *fout, int *numPublications)
 	int			i_pubupdate;
 	int			i_pubdelete;
 	int			i_pubtruncate;
+	int			i_pubddl_all;
+	int			i_pubddl_table;
 	int			i_pubviaroot;
 	int			i,
 				ntups;
@@ -3964,23 +3967,23 @@ getPublications(Archive *fout, int *numPublications)
 	resetPQExpBuffer(query);
 
 	/* Get the publications. */
-	if (fout->remoteVersion >= 130000)
+	if (fout->remoteVersion >= 160000)
 		appendPQExpBufferStr(query,
 							 "SELECT p.tableoid, p.oid, p.pubname, "
 							 "p.pubowner, "
-							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, p.pubviaroot "
+							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, p.pubddl_all, p.pubddl_table, p.pubviaroot "
 							 "FROM pg_publication p");
 	else if (fout->remoteVersion >= 110000)
 		appendPQExpBufferStr(query,
 							 "SELECT p.tableoid, p.oid, p.pubname, "
 							 "p.pubowner, "
-							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, false AS pubviaroot "
+							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, false as p.pubddl_all, false as p.pubddl_table, false AS pubviaroot "
 							 "FROM pg_publication p");
 	else
 		appendPQExpBufferStr(query,
 							 "SELECT p.tableoid, p.oid, p.pubname, "
 							 "p.pubowner, "
-							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, false AS pubtruncate, false AS pubviaroot "
+							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, false AS pubtruncate, false as p.pubddl_all, false as p.pubddl_table, false AS pubviaroot "
 							 "FROM pg_publication p");
 
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
@@ -3996,6 +3999,8 @@ getPublications(Archive *fout, int *numPublications)
 	i_pubupdate = PQfnumber(res, "pubupdate");
 	i_pubdelete = PQfnumber(res, "pubdelete");
 	i_pubtruncate = PQfnumber(res, "pubtruncate");
+	i_pubddl_all = PQfnumber(res, "pubddl_all");
+	i_pubddl_table = PQfnumber(res, "pubddl_table");
 	i_pubviaroot = PQfnumber(res, "pubviaroot");
 
 	pubinfo = pg_malloc(ntups * sizeof(PublicationInfo));
@@ -4019,6 +4024,10 @@ getPublications(Archive *fout, int *numPublications)
 			(strcmp(PQgetvalue(res, i, i_pubdelete), "t") == 0);
 		pubinfo[i].pubtruncate =
 			(strcmp(PQgetvalue(res, i, i_pubtruncate), "t") == 0);
+		pubinfo[i].pubddl_all =
+			(strcmp(PQgetvalue(res, i, i_pubddl_all), "t") == 0);
+		pubinfo[i].pubddl_table =
+			(strcmp(PQgetvalue(res, i, i_pubddl_table), "t") == 0);
 		pubinfo[i].pubviaroot =
 			(strcmp(PQgetvalue(res, i, i_pubviaroot), "t") == 0);
 
@@ -4098,7 +4107,24 @@ dumpPublication(Archive *fout, const PublicationInfo *pubinfo)
 		first = false;
 	}
 
-	appendPQExpBufferChar(query, '\'');
+	appendPQExpBufferStr(query, "'");
+
+	if (pubinfo->pubddl_all || pubinfo->pubddl_table)
+	{
+		appendPQExpBufferStr(query, ", ddl = '");
+		if (pubinfo->pubddl_all)
+			appendPQExpBufferStr(query, "all");
+
+		if (pubinfo->pubddl_table)
+		{
+			if (pubinfo->pubddl_all)
+				appendPQExpBufferStr(query, ", ");
+
+			appendPQExpBufferStr(query, "table");
+		}
+
+		appendPQExpBufferStr(query, "'");
+	}
 
 	if (pubinfo->pubviaroot)
 		appendPQExpBufferStr(query, ", publish_via_partition_root = true");
@@ -4494,6 +4520,7 @@ getSubscriptions(Archive *fout)
 	int			i_subsynccommit;
 	int			i_subpublications;
 	int			i_subbinary;
+	int			i_submatchddlowner;
 	int			i,
 				ntups;
 
@@ -4546,9 +4573,14 @@ getSubscriptions(Archive *fout)
 						  LOGICALREP_TWOPHASE_STATE_DISABLED);
 
 	if (fout->remoteVersion >= 160000)
-		appendPQExpBufferStr(query, " s.suborigin\n");
+		appendPQExpBufferStr(query,
+							 " s.suborigin,\n"
+							 " s.submatchddlowner\n");
 	else
-		appendPQExpBuffer(query, " '%s' AS suborigin\n", LOGICALREP_ORIGIN_ANY);
+		appendPQExpBuffer(query,
+						  " '%s' AS suborigin,\n"
+						  " false AS submatchddlowner\n",
+						  LOGICALREP_ORIGIN_ANY);
 
 	appendPQExpBufferStr(query,
 						 "FROM pg_subscription s\n"
@@ -4576,6 +4608,7 @@ getSubscriptions(Archive *fout)
 	i_subtwophasestate = PQfnumber(res, "subtwophasestate");
 	i_subdisableonerr = PQfnumber(res, "subdisableonerr");
 	i_suborigin = PQfnumber(res, "suborigin");
+	i_submatchddlowner = PQfnumber(res, "submatchddlowner");
 
 	subinfo = pg_malloc(ntups * sizeof(SubscriptionInfo));
 
@@ -4606,6 +4639,8 @@ getSubscriptions(Archive *fout)
 		subinfo[i].subdisableonerr =
 			pg_strdup(PQgetvalue(res, i, i_subdisableonerr));
 		subinfo[i].suborigin = pg_strdup(PQgetvalue(res, i, i_suborigin));
+		subinfo[i].submatchddlowner =
+			pg_strdup(PQgetvalue(res, i, i_submatchddlowner));
 
 		/* Decide whether we want to dump it */
 		selectDumpableObject(&(subinfo[i].dobj), fout);
@@ -4683,6 +4718,9 @@ dumpSubscription(Archive *fout, const SubscriptionInfo *subinfo)
 
 	if (pg_strcasecmp(subinfo->suborigin, LOGICALREP_ORIGIN_ANY) != 0)
 		appendPQExpBuffer(query, ", origin = %s", subinfo->suborigin);
+
+	if (strcmp(subinfo->submatchddlowner, "t") == 0)
+		appendPQExpBufferStr(query, ", match_ddl_owner = true");
 
 	if (strcmp(subinfo->subsynccommit, "off") != 0)
 		appendPQExpBuffer(query, ", synchronous_commit = %s", fmtId(subinfo->subsynccommit));
@@ -7781,6 +7819,50 @@ getTriggers(Archive *fout, TableInfo tblinfo[], int numTables)
 }
 
 /*
+ * getPublicationEventTriggers
+ *	  get the publication event triggers that should be skipped
+ */
+static void
+getPublicationEventTriggers(Archive *fout, SimpleStringList *skipTriggers)
+{
+	PQExpBuffer query;
+	PGresult   *res;
+	int			i;
+	int			ntups;
+
+	query = createPQExpBuffer();
+
+	appendPQExpBufferStr(query,
+						 "SELECT oid FROM pg_publication "
+						 "WHERE pubddl_all OR pubddl_table");
+
+	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
+	ntups = PQntuples(res);
+
+	for (i = 0; i < ntups; i++)
+	{
+		char *trigname;
+		Oid pubid = atooid(PQgetvalue(res, 0, 0));
+
+		trigname = psprintf(PUB_EVENT_TRIG_PREFIX, PUB_TRIG_EVENT1, pubid);
+		simple_string_list_append(skipTriggers, trigname);
+
+		trigname = psprintf(PUB_EVENT_TRIG_PREFIX, PUB_TRIG_EVENT2, pubid);
+		simple_string_list_append(skipTriggers, trigname);
+
+		trigname = psprintf(PUB_EVENT_TRIG_PREFIX, PUB_TRIG_EVENT3, pubid);
+		simple_string_list_append(skipTriggers, trigname);
+
+		trigname = psprintf(PUB_EVENT_TRIG_PREFIX, PUB_TRIG_EVENT4, pubid);
+		simple_string_list_append(skipTriggers, trigname);
+	}
+
+	PQclear(res);
+
+	destroyPQExpBuffer(query);
+}
+
+/*
  * getEventTriggers
  *	  get information about event triggers
  */
@@ -7800,6 +7882,7 @@ getEventTriggers(Archive *fout, int *numEventTriggers)
 				i_evtfname,
 				i_evtenabled;
 	int			ntups;
+	SimpleStringList skipTriggers = {NULL, NULL};
 
 	/* Before 9.3, there are no event triggers */
 	if (fout->remoteVersion < 90300)
@@ -7807,6 +7890,8 @@ getEventTriggers(Archive *fout, int *numEventTriggers)
 		*numEventTriggers = 0;
 		return NULL;
 	}
+
+	getPublicationEventTriggers(fout, &skipTriggers);
 
 	query = createPQExpBuffer();
 
@@ -7852,8 +7937,13 @@ getEventTriggers(Archive *fout, int *numEventTriggers)
 		evtinfo[i].evtenabled = *(PQgetvalue(res, i, i_evtenabled));
 
 		/* Decide whether we want to dump it */
-		selectDumpableObject(&(evtinfo[i].dobj), fout);
+		if (simple_string_list_member(&skipTriggers, evtinfo[i].evtname))
+			evtinfo[i].dobj.dump= DUMP_COMPONENT_NONE;
+		else
+			selectDumpableObject(&(evtinfo[i].dobj), fout);
 	}
+
+	simple_string_list_destroy(&skipTriggers);
 
 	PQclear(res);
 

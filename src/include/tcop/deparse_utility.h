@@ -29,7 +29,11 @@ typedef enum CollectedCommandType
 	SCT_AlterOpFamily,
 	SCT_AlterDefaultPrivileges,
 	SCT_CreateOpClass,
-	SCT_AlterTSConfig
+	SCT_AlterTSConfig,
+	SCT_SecurityLabel,
+	SCT_CreateTableAs,
+	SCT_CreatePublication,
+	SCT_AlterPublication
 } CollectedCommandType;
 
 /*
@@ -39,6 +43,7 @@ typedef struct CollectedATSubcmd
 {
 	ObjectAddress address;		/* affected column, constraint, index, ... */
 	Node	   *parsetree;
+	char	   *usingexpr;
 } CollectedATSubcmd;
 
 typedef struct CollectedCommand
@@ -46,6 +51,7 @@ typedef struct CollectedCommand
 	CollectedCommandType type;
 
 	bool		in_extension;
+	char	   *role;
 	Node	   *parsetree;
 
 	union
@@ -62,6 +68,7 @@ typedef struct CollectedCommand
 		{
 			Oid			objectId;
 			Oid			classId;
+			bool		rewrite;
 			List	   *subcmds;
 		}			alterTable;
 
@@ -87,6 +94,22 @@ typedef struct CollectedCommand
 			List	   *procedures;
 		}			createopc;
 
+		/* CREATE PUBLICATION */
+		struct
+		{
+			ObjectAddress address;
+			List	   *rels;
+			List	   *schemas;
+		}			createpub;
+
+		/* ALTER PUBLICATION */
+		struct alterpub
+		{
+			ObjectAddress address;
+			List	   *rels;
+			List	   *schemas;
+		}			alterpub;
+
 		/* ALTER TEXT SEARCH CONFIGURATION ADD/ALTER/DROP MAPPING */
 		struct
 		{
@@ -100,6 +123,20 @@ typedef struct CollectedCommand
 		{
 			ObjectType	objtype;
 		}			defprivs;
+
+		/* SECURITY LABEL */
+		struct
+		{
+			ObjectAddress address;
+			char		 *provider;
+		}			seclabel;
+
+		/* CREATE TABLE AS */
+		struct
+		{
+			ObjectAddress address;
+			Node		 *real_create;
+		}			ctas;
 	}			d;
 
 	struct CollectedCommand *parent;	/* when nested */
