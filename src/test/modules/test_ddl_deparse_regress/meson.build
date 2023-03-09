@@ -31,9 +31,10 @@ tests += {
       'test_ddl_deparse',
       'create_extension',
       'create_schema',
-      'create_table',
       'aggregate',
-      'create_table_test'
+      'create_table_test',
+      'constraints',
+      'alter_table'
     ],
   },
   'tap': {
