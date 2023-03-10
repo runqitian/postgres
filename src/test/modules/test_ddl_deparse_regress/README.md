@@ -23,9 +23,9 @@ Run `make check`, it will run the SQL tests first, then it will run the TAP test
 
 ## How to add more test cases and find out the failure?
 
-You can add test cases to existed files in `sql` folder directly. If you need to create a new test file, you can create a file in `sql` folder, add that test file name to `meson.build` and `Makefile` following the convention same as other test file.
+You can add test cases to existed files in `sql` folder directly. If you need to create a new test file, you can create a file in `sql` folder, add that test file name to `meson.build` and `Makefile` following the convention used by other test files.
 
-After you added you test cases, run `make check` and check goal 1 and goal 2 of the added test cases in `results` folder, if the result is right, copy that file to `expected` folder.
+After you have added you test cases, run `make check` and check goal 1 and goal 2 of the added test cases in `results` folder, if the result is right, copy that file to `expected` folder.
 
 Now SQL tests should pass, run `make check` again to check the TAP tests. If everything passed, this test case also meet goal 3. If it fails, check the error message to locate the failure position. 
 

@@ -150,17 +150,17 @@ CREATE TABLE part2_tablespace_pg_default(
 NOTICE:  deparsed json: {"fmt": "CREATE %{persistence}s TABLE %{if_not_exists}s %{identity}D (%{table_elements:, }s) %{inherits}s %{tablespace}s %{on_commit}s %{partition_by}s %{access_method}s %{with_clause}s", "identity": {"objname": "part2_tablespace_pg_default", "schemaname": "public"}, "inherits": {"fmt": "INHERITS (%{parents:, }D)", "parents": null, "present": false}, "on_commit": {"fmt": "ON COMMIT %{on_commit_value}s", "present": false, "on_commit_value": null}, "tablespace": {"fmt": "TABLESPACE %{tablespace}I", "tablespace": "pg_default"}, "persistence": "", "with_clause": {"fmt": "WITH", "present": false}, "partition_by": {"fmt": "PARTITION BY %{definition}s", "present": false, "definition": null}, "access_method": {"fmt": "USING %{access_method}I", "present": false, "access_method": null}, "if_not_exists": "", "table_elements": [{"fmt": "%{name}I %{coltype}T STORAGE %{colstorage}s %{compression}s %{collation}s %{not_null}s %{default}s %{generated_column}s", "name": "id", "type": "column", "coltype": {"typmod": "", "typarray": false, "typename": "int4", "schemaname": "pg_catalog"}, "default": {"fmt": "DEFAULT", "present": false}, "not_null": "", "collation": {"fmt": "COLLATE", "present": false}, "colstorage": "plain", "compression": {"fmt": "COMPRESSION %{compression_method}I", "present": false, "compression_method": null}, "generated_column": {"fmt": "GENERATED ALWAYS AS", "present": false}}, {"fmt": "%{name}I %{coltype}T STORAGE %{colstorage}s %{compression}s %{collation}s %{not_null}s %{default}s %{generated_column}s", "name": "name", "type": "column", "coltype": {"typmod": "", "typarray": false, "typename": "varchar", "schemaname": "pg_catalog"}, "default": {"fmt": "DEFAULT", "present": false}, "not_null": "", "collation": {"fmt": "COLLATE %{name}D", "name": {"objname": "default", "schemaname": "pg_catalog"}}, "colstorage": "extended", "compression": {"fmt": "COMPRESSION %{compression_method}I", "present": false, "compression_method": null}, "generated_column": {"fmt": "GENERATED ALWAYS AS", "present": false}}]}
 NOTICE:  re-formed command: CREATE  TABLE  public.part2_tablespace_pg_default (id pg_catalog.int4 STORAGE plain     , name pg_catalog."varchar" STORAGE extended  COLLATE pg_catalog."default"   )  TABLESPACE pg_default    
 -- some complex combinations from the components above
--- TOFIX: failure case 1 in CREATE TABLE in https://quip-amazon.com/lWMEADkOt12v/DDL-Deparser-testing-failed-cases
+-- TOFIX
 -- CREATE TEMPORARY TABLE part2_combination_1(
 --     id int,
 --     name varchar
 -- ) PARTITION BY RANGE (id) ON COMMIT PRESERVE ROWS;
--- TOFIX: failure case 2 in CREATE TABLE in https://quip-amazon.com/lWMEADkOt12v/DDL-Deparser-testing-failed-cases
+-- TOFIX
 -- CREATE LOCAL TEMP TABLE part2_combination_2(
 --     id int,
 --     name varchar
 -- ) USING heap WITH (vacuum_index_cleanup = ON, autovacuum_vacuum_scale_factor = 0.2, vacuum_truncate = true) ON COMMIT PRESERVE ROWS TABLESPACE pg_default;
--- TOFIX: failure case 3 in CREATE TABLE in https://quip-amazon.com/lWMEADkOt12v/DDL-Deparser-testing-failed-cases
+-- TOFIX
 -- CREATE TABLE part2_combination_3(
 --     id int,
 --     name varchar
@@ -371,7 +371,7 @@ CREATE TABLE part7_data_types(
     var34 polygon,
     var35 float4,
     var36 int2,
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNc25b671e9b4947e3856c95333
+-- TOFIX
     -- var37 serial2,
     -- var38 serial4,
     var39 text,
@@ -408,7 +408,7 @@ CREATE TABLE part7_inherits_parent(
 INHERITS (part7_data_types, part7_compression_collate);
 NOTICE:  deparsed json: {"fmt": "CREATE %{persistence}s TABLE %{if_not_exists}s %{identity}D (%{table_elements:, }s) %{inherits}s %{tablespace}s %{on_commit}s %{partition_by}s %{access_method}s %{with_clause}s", "identity": {"objname": "part7_inherits_parent", "schemaname": "public"}, "inherits": {"fmt": "INHERITS (%{parents:, }D)", "parents": [{"objname": "part7_data_types", "schemaname": "public"}, {"objname": "part7_compression_collate", "schemaname": "public"}]}, "on_commit": {"fmt": "ON COMMIT %{on_commit_value}s", "present": false, "on_commit_value": null}, "tablespace": {"fmt": "TABLESPACE %{tablespace}I", "present": false, "tablespace": null}, "persistence": "", "with_clause": {"fmt": "WITH", "present": false}, "partition_by": {"fmt": "PARTITION BY %{definition}s", "present": false, "definition": null}, "access_method": {"fmt": "USING %{access_method}I", "present": false, "access_method": null}, "if_not_exists": "", "table_elements": [{"fmt": "%{name}I %{coltype}T STORAGE %{colstorage}s %{compression}s %{collation}s %{not_null}s %{default}s %{generated_column}s", "name": "id", "type": "column", "coltype": {"typmod": "", "typarray": false, "typename": "int4", "schemaname": "pg_catalog"}, "default": {"fmt": "DEFAULT", "present": false}, "not_null": "", "collation": {"fmt": "COLLATE", "present": false}, "colstorage": "plain", "compression": {"fmt": "COMPRESSION %{compression_method}I", "present": false, "compression_method": null}, "generated_column": {"fmt": "GENERATED ALWAYS AS", "present": false}}, {"fmt": "%{name}I %{coltype}T STORAGE %{colstorage}s %{compression}s %{collation}s %{not_null}s %{default}s %{generated_column}s", "name": "name", "type": "column", "coltype": {"typmod": "", "typarray": false, "typename": "varchar", "schemaname": "pg_catalog"}, "default": {"fmt": "DEFAULT", "present": false}, "not_null": "", "collation": {"fmt": "COLLATE %{name}D", "name": {"objname": "default", "schemaname": "pg_catalog"}}, "colstorage": "extended", "compression": {"fmt": "COMPRESSION %{compression_method}I", "present": false, "compression_method": null}, "generated_column": {"fmt": "GENERATED ALWAYS AS", "present": false}}]}
 NOTICE:  re-formed command: CREATE  TABLE  public.part7_inherits_parent (id pg_catalog.int4 STORAGE plain     , name pg_catalog."varchar" STORAGE extended  COLLATE pg_catalog."default"   ) INHERITS (public.part7_data_types, public.part7_compression_collate)     
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNf80e358da1f44708a54c402fa
+-- TOFIX
 -- CREATE TABLE part7_combine_all_clauses(
 --     id varchar(5) COMPRESSION "pglz" COLLATE "fr_FR" CONSTRAINT id_constraint DEFAULT 'foo',
 --     PRIMARY KEY (id),
@@ -419,7 +419,7 @@ NOTICE:  re-formed command: CREATE  TABLE  public.part7_inherits_parent (id pg_c
 -- USING heap 
 -- WITH (vacuum_index_cleanup = ON, autovacuum_vacuum_scale_factor = 0.2, vacuum_truncate = true)
 -- TABLESPACE pg_default;
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNf80e358da1f44708a54c402fa
+-- TOFIX
 -- CREATE TEMP TABLE part7_combine_all_clauses_temp(
 --     id varchar(5) COMPRESSION "pglz" COLLATE "fr_FR" CONSTRAINT id_constraint DEFAULT 'foo',
 --     PRIMARY KEY (id),
@@ -466,7 +466,7 @@ NOTICE:  deparsed json: <NULL>
 NOTICE:  re-formed command: <NULL>
 NOTICE:  deparsed json: <NULL>
 NOTICE:  re-formed command: <NULL>
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNf80e358da1f44708a54c402fa
+-- TOFIX
 -- CREATE TABLE part8_create_typed_table_complex_combinations OF part8_people_type(
 --     weight WITH OPTIONS NOT NULL,
 --     name UNIQUE,
@@ -500,7 +500,7 @@ CREATE TABLE part9_parent_table_hash(
 ) PARTITION BY HASH (id);
 NOTICE:  deparsed json: {"fmt": "CREATE %{persistence}s TABLE %{if_not_exists}s %{identity}D (%{table_elements:, }s) %{inherits}s %{tablespace}s %{on_commit}s %{partition_by}s %{access_method}s %{with_clause}s", "identity": {"objname": "part9_parent_table_hash", "schemaname": "public"}, "inherits": {"fmt": "INHERITS (%{parents:, }D)", "parents": null, "present": false}, "on_commit": {"fmt": "ON COMMIT %{on_commit_value}s", "present": false, "on_commit_value": null}, "tablespace": {"fmt": "TABLESPACE %{tablespace}I", "present": false, "tablespace": null}, "persistence": "", "with_clause": {"fmt": "WITH", "present": false}, "partition_by": {"fmt": "PARTITION BY %{definition}s", "definition": "HASH (id)"}, "access_method": {"fmt": "USING %{access_method}I", "present": false, "access_method": null}, "if_not_exists": "", "table_elements": [{"fmt": "%{name}I %{coltype}T STORAGE %{colstorage}s %{compression}s %{collation}s %{not_null}s %{default}s %{generated_column}s", "name": "id", "type": "column", "coltype": {"typmod": "", "typarray": false, "typename": "int4", "schemaname": "pg_catalog"}, "default": {"fmt": "DEFAULT", "present": false}, "not_null": "", "collation": {"fmt": "COLLATE", "present": false}, "colstorage": "plain", "compression": {"fmt": "COMPRESSION %{compression_method}I", "present": false, "compression_method": null}, "generated_column": {"fmt": "GENERATED ALWAYS AS", "present": false}}, {"fmt": "%{name}I %{coltype}T STORAGE %{colstorage}s %{compression}s %{collation}s %{not_null}s %{default}s %{generated_column}s", "name": "name", "type": "column", "coltype": {"typmod": "", "typarray": false, "typename": "varchar", "schemaname": "pg_catalog"}, "default": {"fmt": "DEFAULT", "present": false}, "not_null": "", "collation": {"fmt": "COLLATE %{name}D", "name": {"objname": "default", "schemaname": "pg_catalog"}}, "colstorage": "extended", "compression": {"fmt": "COMPRESSION %{compression_method}I", "present": false, "compression_method": null}, "generated_column": {"fmt": "GENERATED ALWAYS AS", "present": false}}, {"fmt": "%{name}I %{coltype}T STORAGE %{colstorage}s %{compression}s %{collation}s %{not_null}s %{default}s %{generated_column}s", "name": "height", "type": "column", "coltype": {"typmod": "", "typarray": false, "typename": "float4", "schemaname": "pg_catalog"}, "default": {"fmt": "DEFAULT", "present": false}, "not_null": "", "collation": {"fmt": "COLLATE", "present": false}, "colstorage": "plain", "compression": {"fmt": "COMPRESSION %{compression_method}I", "present": false, "compression_method": null}, "generated_column": {"fmt": "GENERATED ALWAYS AS", "present": false}}, {"fmt": "%{name}I %{coltype}T STORAGE %{colstorage}s %{compression}s %{collation}s %{not_null}s %{default}s %{generated_column}s", "name": "weight", "type": "column", "coltype": {"typmod": "", "typarray": false, "typename": "float4", "schemaname": "pg_catalog"}, "default": {"fmt": "DEFAULT", "present": false}, "not_null": "", "collation": {"fmt": "COLLATE", "present": false}, "colstorage": "plain", "compression": {"fmt": "COMPRESSION %{compression_method}I", "present": false, "compression_method": null}, "generated_column": {"fmt": "GENERATED ALWAYS AS", "present": false}}]}
 NOTICE:  re-formed command: CREATE  TABLE  public.part9_parent_table_hash (id pg_catalog.int4 STORAGE plain     , name pg_catalog."varchar" STORAGE extended  COLLATE pg_catalog."default"   , height pg_catalog.float4 STORAGE plain     , weight pg_catalog.float4 STORAGE plain     )    PARTITION BY HASH (id)  
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNba4db3a8ff9844f6999bc891b
+-- TOFIX
 -- CREATE TABLE part9_partition_with_options_constraints
 -- PARTITION OF part9_parent_table_range (
 --     id PRIMARY KEY,
@@ -509,14 +509,14 @@ NOTICE:  re-formed command: CREATE  TABLE  public.part9_parent_table_hash (id pg
 --     CHECK (height > 0)
 -- )
 -- FOR VALUES FROM (MINVALUE) TO (2);
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNba4db3a8ff9844f6999bc891b
+-- TOFIX
 -- CREATE TABLE part9_partition_with_options_constraints_default
 -- PARTITION OF part9_parent_table_range (
 --     id PRIMARY KEY,
 --     name WITH OPTIONS NOT NULL,
 --     CHECK (height > 0)
 -- ) DEFAULT;
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNf80e358da1f44708a54c402fa
+-- TOFIX
 -- CREATE TABLE part9_partition_complex_combinations
 -- PARTITION OF part9_parent_table_range (
 --     id PRIMARY KEY,
