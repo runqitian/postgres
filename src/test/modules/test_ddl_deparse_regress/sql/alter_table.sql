@@ -251,7 +251,7 @@ ALTER TABLE test_drop_constraint DROP CONSTRAINT test_drop_constraint_check REST
 -- TOFIX
 -- ALTER TABLE test_drop_constraint DROP CONSTRAINT test_drop_constraint_uniq CASCADE;
 
--- This should be included in trigger DDL commands testing
+-- TODO: This should be tested with TRIGGER related testing
 -- DISABLE TRIGGER [ trigger_name | ALL | USER ]
 -- ENABLE TRIGGER [ trigger_name | ALL | USER ]
 -- ENABLE REPLICA TRIGGER trigger_name
@@ -476,8 +476,8 @@ ALTER TABLE test_set_schema SET SCHEMA new_test_schema;
 
 -- ALTER TABLE ALL IN TABLESPACE name [ OWNED BY role_name [, ... ] ]
 --     SET TABLESPACE new_tablespace [ NOWAIT ]
-ALTER TABLE ALL IN TABLESPACE pg_default SET TABLESPACE pg_default;
--- TOFIX
+-- TOFIX: can not be caught by ddl_command_end event trigger
+-- ALTER TABLE ALL IN TABLESPACE pg_default SET TABLESPACE pg_default;
 -- ALTER TABLE ALL IN TABLESPACE pg_default OWNED BY ddl_testing_role SET TABLESPACE pg_default;
 
 -- ATTACH PARTITION partition_name { FOR VALUES partition_bound_spec | DEFAULT }

@@ -15,8 +15,24 @@ DDL Deparser provides the ability to encode the original DDL command to a JSON s
 
 Goal 3 is tested with TAP framework in t/001_compare_dumped_results.pl
 
-Goal 4 is tested with TAP framework and pg_regress in 002_regress_tests.pl
+Goal 4 is tested with TAP framework and pg_regress in 002_regress_tests.pl (Not enabled)
 
 ## Usage
 
 Run `make check`, it will run the SQL tests first, then it will run the TAP tests. The execution of 002_regress_tests.pl is currently commented out because it will fail due to unimplemented commands in the DDL deparser.
+
+## How to add more test cases and find out the failure?
+
+You can add test cases to existed files in `sql` folder directly. If you need to create a new test file, you can create a file in `sql` folder, add that test file name to `meson.build` and `Makefile` following the convention same as other test file.
+
+After you added you test cases, run `make check` and check goal 1 and goal 2 of the added test cases in `results` folder, if the result is right, copy that file to `expected` folder.
+
+Now SQL tests should pass, run `make check` again to check the TAP tests. If everything passed, this test case also meet goal 3. If it fails, check the error message to locate the failure position. 
+
+You can find execution logs are in `tmp_check/log` folder, dumped results are in `tmp_check/dumps` folder, reformed sql commands are in `tmp_check/ddl` folder for further investigation.
+
+
+
+
+
+

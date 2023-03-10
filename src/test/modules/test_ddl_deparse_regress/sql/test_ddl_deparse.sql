@@ -1,3 +1,6 @@
+CREATE ROLE ddl_testing_role SUPERUSER;
+SET ROLE ddl_testing_role;
+
 CREATE EXTENSION test_ddl_deparse_regress;
 
 CREATE OR REPLACE FUNCTION test_ddl_deparse()

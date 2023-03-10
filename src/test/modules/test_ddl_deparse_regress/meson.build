@@ -32,7 +32,7 @@ tests += {
       'create_extension',
       'create_schema',
       'aggregate',
-      'create_table_test',
+      'create_table',
       'constraints',
       'alter_table'
     ],

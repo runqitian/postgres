@@ -26,7 +26,8 @@ sub execute_test_case {
     #     extra_params => ["-U ${user}"]);
     $pub_node -> psql($dbname, $content,
         stderr => \$pub_node_error,
-        on_error_stop => 0);
+        on_error_stop => 0,
+        extra_params => ["-U", "${user}"]);
     # check execution of test SQL commands
     ok($pub_node_error eq '', "execute test SQL commands from ".$test_name) or diag("Failure from "
         .$test_file.": ".$pub_node_error);
@@ -35,7 +36,8 @@ sub execute_test_case {
     my $ddl_sql = '';
     $pub_node -> psql($dbname,q(
         select ddl_deparse_expand_command(ddl) || ';' from deparsed_ddls ORDER BY id ASC),
-        stdout => \$ddl_sql);
+        stdout => \$ddl_sql,
+        extra_params => ["-U", "${user}"]);
     mkdir ${outputdir}."/ddl", 0755;
     my $ddl_output_file = ${outputdir}."/ddl/${test_name}.sql";
     open(FH, '>', $ddl_output_file) or die $!;
@@ -48,7 +50,8 @@ sub execute_test_case {
     #     stderr => \$sub_node_error,
     #     extra_params => ["-U ${user}"]);
     $sub_node -> psql($dbname, $ddl_sql,
-        stderr => \$sub_node_error);
+        stderr => \$sub_node_error,
+        extra_params => ["-U", "${user}"]);
     # check execution of reformed DDL commands
     ok($sub_node_error eq '', "replay reformed DDL commands from ".$test_name) or diag("Failure from "
         .$ddl_output_file.": ".$sub_node_error);
@@ -165,6 +168,13 @@ sub clean_deparse_testing_resources_on_pub_node {
     ));
 }
 
+sub create_prerequisite_resources {
+    my $node = $_[0];
+    my $dbname = $_[1];
+    my $user = $_[2];
+    $node -> safe_psql($dbname, "CREATE ROLE ${user} SUPERUSER LOGIN CREATEDB;");
+}
+
 sub trim {
     my @out = @_;
     for (@out) {
@@ -175,10 +185,12 @@ sub trim {
 }
 
 # Create and start pub sub nodes
-my $pub_node = init_pub_node("test");
-my $sub_node = init_sub_node("test");
 my $initial_dbname = "postgres";
 my $user = "ddl_testing_role";
+my $pub_node = init_pub_node("test", $user);
+my $sub_node = init_sub_node("test", $user);
+create_prerequisite_resources($pub_node, $initial_dbname, $user);
+create_prerequisite_resources($sub_node, $initial_dbname, $user);
 
 # load test cases from the regression tests
 my @regress_tests = split /\s+/, $ENV{REGRESS};
@@ -195,12 +207,8 @@ foreach(@regress_tests) {
         next;
     }
     my $test_dbname = $test_name;
-    # $pub_node -> safe_psql($initial_dbname, "CREATE ROLE ${user} SUPERUSER LOGIN CREATEDB;");
-    # $pub_node -> safe_psql($initial_dbname, "CREATE DATABASE ".$test_dbname, extra_params => ["-U ${user}"]);
-    $pub_node -> safe_psql($initial_dbname, "CREATE DATABASE ".$test_dbname);
-    # $sub_node -> safe_psql($initial_dbname, "CREATE ROLE ${user} SUPERUSER LOGIN CREATEDB;");
-    # $sub_node -> safe_psql($initial_dbname, "CREATE DATABASE ".$test_dbname, extra_params => ["-U ${user}"]);
-    $sub_node -> safe_psql($initial_dbname, "CREATE DATABASE ".$test_dbname);
+    $pub_node -> safe_psql($initial_dbname, "CREATE DATABASE ${test_dbname};", extra_params => ["-U", "${user}"]);
+    $sub_node -> safe_psql($initial_dbname, "CREATE DATABASE ${test_dbname};", extra_params => ["-U", "${user}"]);
     execute_test_case($test_name, $pub_node, $sub_node, $test_dbname, $user);
 }
 done_testing();
