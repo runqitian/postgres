@@ -20,10 +20,6 @@ sub execute_test_case {
     my $test_file = "./sql/${test_name}.sql";
     my $content = do{local(@ARGV,$/)=$test_file;<>};
     my $pub_node_error = '';
-    # $pub_node -> psql($dbname, $content,
-    #     stderr => \$pub_node_error,
-    #     on_error_stop => 0,
-    #     extra_params => ["-U ${user}"]);
     $pub_node -> psql($dbname, $content,
         stderr => \$pub_node_error,
         on_error_stop => 0,
@@ -46,9 +42,6 @@ sub execute_test_case {
 
     # execute reformed SQL commands on sub node
     my $sub_node_error = '';
-    # $sub_node -> psql($dbname, $ddl_sql,
-    #     stderr => \$sub_node_error,
-    #     extra_params => ["-U ${user}"]);
     $sub_node -> psql($dbname, $ddl_sql,
         stderr => \$sub_node_error,
         extra_params => ["-U", "${user}"]);

@@ -16,7 +16,7 @@ CREATE TABLE parent_table(
 CREATE TABLE test_only () INHERITS (parent_table);
 ALTER TABLE test_only ADD col1 int;
 ALTER TABLE IF EXISTS fake_table ADD col2 int;
--- TOFIX: Case 9 in https://quip-amazon.com/lWMEADkOt12v/DDL-Deparser-testing-failed-cases
+-- TOFIX
 -- ALTER TABLE IF EXISTS ONLY parent_table ADD PRIMARY KEY (id);
 ALTER TABLE IF EXISTS parent_table * ADD CHECK (id > 10);
 
@@ -28,7 +28,7 @@ ALTER TABLE test_add_column ADD col1 int;
 ALTER TABLE test_add_column ADD COLUMN col2 int;
 ALTER TABLE test_add_column ADD COLUMN IF NOT EXISTS col2 varchar;
 ALTER TABLE test_add_column ADD col3 varchar COLLATE "fr_FR";
--- TOFIX: Case 8 in https://quip-amazon.com/lWMEADkOt12v/DDL-Deparser-testing-failed-cases
+-- TOFIX
 -- ALTER TABLE test_add_column ADD col4 int CHECK (col4 > 100) UNIQUE;
 ALTER TABLE test_add_column ADD COLUMN IF NOT EXISTS col5 text COLLATE "es_ES" DEFAULT 'foo' NOT NULL;
 
@@ -44,9 +44,9 @@ CREATE TABLE foreign_table(
 );
 ALTER TABLE test_drop_column DROP price;
 ALTER TABLE test_drop_column DROP COLUMN quantity;
--- TOFIX: Case 10 in https://quip-amazon.com/lWMEADkOt12v/DDL-Deparser-testing-failed-cases
+-- TOFIX
 -- ALTER TABLE test_drop_column DROP IF EXISTS description RESTRICT;
--- TOFIX: Case 7 in https://quip-amazon.com/lWMEADkOt12v/DDL-Deparser-testing-failed-cases
+-- TOFIX
 -- ALTER TABLE test_drop_column DROP IF EXISTS name CASCADE;
 
 -- ALTER [ COLUMN ] column_name [ SET DATA ] TYPE data_type [ COLLATE collation ] [ USING expression ]
@@ -169,7 +169,7 @@ ALTER TABLE test_set_compression ALTER COLUMN description SET COMPRESSION "lz4";
 CREATE TABLE test_add_table_constraint(
     LIKE orders
 );
--- TOFIX: Case 9 in https://quip-amazon.com/lWMEADkOt12v/DDL-Deparser-testing-failed-cases
+-- TOFIX
 -- ALTER TABLE test_add_table_constraint ADD PRIMARY KEY (id);
 ALTER TABLE test_add_table_constraint ADD CONSTRAINT max_name_len CHECK (length(name) < 4) NOT VALID;
 ALTER TABLE test_add_table_constraint ADD CHECK (id < 10);

@@ -109,19 +109,19 @@ CREATE TABLE part2_tablespace_pg_default(
 
 -- some complex combinations from the components above
 
--- TOFIX: failure case 1 in CREATE TABLE in https://quip-amazon.com/lWMEADkOt12v/DDL-Deparser-testing-failed-cases
+-- TOFIX
 -- CREATE TEMPORARY TABLE part2_combination_1(
 --     id int,
 --     name varchar
 -- ) PARTITION BY RANGE (id) ON COMMIT PRESERVE ROWS;
 
--- TOFIX: failure case 2 in CREATE TABLE in https://quip-amazon.com/lWMEADkOt12v/DDL-Deparser-testing-failed-cases
+-- TOFIX
 -- CREATE LOCAL TEMP TABLE part2_combination_2(
 --     id int,
 --     name varchar
 -- ) USING heap WITH (vacuum_index_cleanup = ON, autovacuum_vacuum_scale_factor = 0.2, vacuum_truncate = true) ON COMMIT PRESERVE ROWS TABLESPACE pg_default;
 
--- TOFIX: failure case 3 in CREATE TABLE in https://quip-amazon.com/lWMEADkOt12v/DDL-Deparser-testing-failed-cases
+-- TOFIX
 -- CREATE TABLE part2_combination_3(
 --     id int,
 --     name varchar
@@ -273,7 +273,7 @@ CREATE TABLE part7_data_types(
     var34 polygon,
     var35 float4,
     var36 int2,
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNc25b671e9b4947e3856c95333
+-- TOFIX
     -- var37 serial2,
     -- var38 serial4,
     var39 text,
@@ -301,7 +301,7 @@ CREATE TABLE part7_inherits_parent(
 )
 INHERITS (part7_data_types, part7_compression_collate);
 
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNf80e358da1f44708a54c402fa
+-- TOFIX
 -- CREATE TABLE part7_combine_all_clauses(
 --     id varchar(5) COMPRESSION "pglz" COLLATE "fr_FR" CONSTRAINT id_constraint DEFAULT 'foo',
 --     PRIMARY KEY (id),
@@ -313,7 +313,7 @@ INHERITS (part7_data_types, part7_compression_collate);
 -- WITH (vacuum_index_cleanup = ON, autovacuum_vacuum_scale_factor = 0.2, vacuum_truncate = true)
 -- TABLESPACE pg_default;
 
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNf80e358da1f44708a54c402fa
+-- TOFIX
 -- CREATE TEMP TABLE part7_combine_all_clauses_temp(
 --     id varchar(5) COMPRESSION "pglz" COLLATE "fr_FR" CONSTRAINT id_constraint DEFAULT 'foo',
 --     PRIMARY KEY (id),
@@ -344,7 +344,7 @@ CREATE TABLE part8_create_typed_table_with_options_constaints OF part8_people_ty
     PRIMARY KEY (id)
 );
 
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNf80e358da1f44708a54c402fa
+-- TOFIX
 -- CREATE TABLE part8_create_typed_table_complex_combinations OF part8_people_type(
 --     weight WITH OPTIONS NOT NULL,
 --     name UNIQUE,
@@ -374,7 +374,7 @@ CREATE TABLE part9_parent_table_hash(
     weight float4
 ) PARTITION BY HASH (id);
 
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNba4db3a8ff9844f6999bc891b
+-- TOFIX
 -- CREATE TABLE part9_partition_with_options_constraints
 -- PARTITION OF part9_parent_table_range (
 --     id PRIMARY KEY,
@@ -384,7 +384,7 @@ CREATE TABLE part9_parent_table_hash(
 -- )
 -- FOR VALUES FROM (MINVALUE) TO (2);
 
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNba4db3a8ff9844f6999bc891b
+-- TOFIX
 -- CREATE TABLE part9_partition_with_options_constraints_default
 -- PARTITION OF part9_parent_table_range (
 --     id PRIMARY KEY,
@@ -392,7 +392,7 @@ CREATE TABLE part9_parent_table_hash(
 --     CHECK (height > 0)
 -- ) DEFAULT;
 
--- TOFIX: https://quip-amazon.com/lWMEADkOt12v#temp:C:RSNf80e358da1f44708a54c402fa
+-- TOFIX
 -- CREATE TABLE part9_partition_complex_combinations
 -- PARTITION OF part9_parent_table_range (
 --     id PRIMARY KEY,
