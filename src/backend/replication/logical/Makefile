@@ -16,6 +16,7 @@ override CPPFLAGS := -I$(srcdir) $(CPPFLAGS)
 
 OBJS = \
 	applyparallelworker.o \
+	ddlmessage.o \
 	decode.o \
 	launcher.o \
 	logical.o \
