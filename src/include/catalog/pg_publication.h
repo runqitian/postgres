@@ -18,8 +18,8 @@
 #define PG_PUBLICATION_H
 
 #include "catalog/genbki.h"
-#include "catalog/objectaddress.h"
 #include "catalog/pg_publication_d.h"
+#include "nodes/pg_list.h"
 
 /* ----------------
  *		pg_publication definition.  cpp turns this into
@@ -103,12 +103,6 @@ typedef struct Publication
 	PublicationActions pubactions;
 } Publication;
 
-typedef struct PublicationRelInfo
-{
-	Relation	relation;
-	Node	   *whereClause;
-	List	   *columns;
-} PublicationRelInfo;
 
 extern Publication *GetPublication(Oid pubid);
 extern Publication *GetPublicationByName(const char *pubname, bool missing_ok);
@@ -144,15 +138,6 @@ extern List *GetPubPartitionOptionRelations(List *result,
 											Oid relid);
 extern Oid	GetTopMostAncestorInPublication(Oid puboid, List *ancestors,
 											int *ancestor_level);
-
-extern bool is_publishable_relation(Relation rel);
 extern bool is_schema_publication(Oid pubid);
-extern ObjectAddress publication_add_relation(Oid pubid, PublicationRelInfo *pri,
-											  bool if_not_exists);
-extern ObjectAddress publication_add_schema(Oid pubid, Oid schemaid,
-											bool if_not_exists);
-
-extern Bitmapset *pub_collist_to_bitmapset(Bitmapset *columns, Datum pubcols,
-										   MemoryContext mcxt);
 
 #endif							/* PG_PUBLICATION_H */

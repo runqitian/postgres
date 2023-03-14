@@ -2457,6 +2457,7 @@ SeqScan
 SeqScanState
 SeqTable
 SeqTableData
+Sequence_values
 SerCommitSeqNo
 SerialControl
 SerializableXactHandle

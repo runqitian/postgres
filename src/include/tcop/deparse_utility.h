@@ -29,7 +29,8 @@ typedef enum CollectedCommandType
 	SCT_AlterOpFamily,
 	SCT_AlterDefaultPrivileges,
 	SCT_CreateOpClass,
-	SCT_AlterTSConfig
+	SCT_AlterTSConfig,
+	SCT_SecurityLabel
 } CollectedCommandType;
 
 /*
@@ -100,6 +101,13 @@ typedef struct CollectedCommand
 		{
 			ObjectType	objtype;
 		}			defprivs;
+
+		/* SECURITY LABEL */
+		struct
+		{
+			ObjectAddress address;
+			char		 *provider;
+		}			seclabel;
 	}			d;
 
 	struct CollectedCommand *parent;	/* when nested */

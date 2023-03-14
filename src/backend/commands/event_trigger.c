@@ -48,45 +48,7 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-typedef struct EventTriggerQueryState
-{
-	/* memory context for this state's objects */
-	MemoryContext cxt;
-
-	/* sql_drop */
-	slist_head	SQLDropList;
-	bool		in_sql_drop;
-
-	/* table_rewrite */
-	Oid			table_rewrite_oid;	/* InvalidOid, or set for table_rewrite
-									 * event */
-	int			table_rewrite_reason;	/* AT_REWRITE reason */
-
-	/* Support for command collection */
-	bool		commandCollectionInhibited;
-	CollectedCommand *currentCommand;
-	List	   *commandList;	/* list of CollectedCommand; see
-								 * deparse_utility.h */
-	struct EventTriggerQueryState *previous;
-} EventTriggerQueryState;
-
-static EventTriggerQueryState *currentEventTriggerState = NULL;
-
-/* Support for dropped objects */
-typedef struct SQLDropObject
-{
-	ObjectAddress address;
-	const char *schemaname;
-	const char *objname;
-	const char *objidentity;
-	const char *objecttype;
-	List	   *addrnames;
-	List	   *addrargs;
-	bool		original;
-	bool		normal;
-	bool		istemp;
-	slist_node	next;
-} SQLDropObject;
+EventTriggerQueryState *currentEventTriggerState = NULL;
 
 static void AlterEventTriggerOwner_internal(Relation rel,
 											HeapTuple tup,
@@ -1813,6 +1775,36 @@ EventTriggerCollectAlterDefPrivs(AlterDefaultPrivilegesStmt *stmt)
 }
 
 /*
+ * EventTriggerCollectSecLabel
+ *		Save data about an SECURITY LABEL command being executed
+ */
+void
+EventTriggerCollectSecLabel(ObjectAddress address, char *provider,
+							SecLabelStmt *stmt)
+{
+	MemoryContext oldcxt;
+	CollectedCommand *command;
+
+	/* ignore if event trigger context not set, or collection disabled */
+	if (!currentEventTriggerState ||
+		currentEventTriggerState->commandCollectionInhibited)
+		return;
+
+	oldcxt = MemoryContextSwitchTo(currentEventTriggerState->cxt);
+
+	command = palloc0(sizeof(CollectedCommand));
+	command->type = SCT_SecurityLabel;
+	command->in_extension = creating_extension;
+	command->d.seclabel.address = address;
+	command->d.seclabel.provider = provider;
+	command->parsetree = (Node *) copyObject(stmt);
+
+	currentEventTriggerState->commandList =
+		lappend(currentEventTriggerState->commandList, command);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
  * In a ddl_command_end event trigger, this function reports the DDL commands
  * being run.
  */
@@ -1863,6 +1855,7 @@ pg_event_trigger_ddl_commands(PG_FUNCTION_ARGS)
 			case SCT_AlterOpFamily:
 			case SCT_CreateOpClass:
 			case SCT_AlterTSConfig:
+			case SCT_SecurityLabel:
 				{
 					char	   *identity;
 					char	   *type;
@@ -1880,6 +1873,8 @@ pg_event_trigger_ddl_commands(PG_FUNCTION_ARGS)
 						addr = cmd->d.createopc.address;
 					else if (cmd->type == SCT_AlterTSConfig)
 						addr = cmd->d.atscfg.address;
+					else if (cmd->type == SCT_SecurityLabel)
+						addr = cmd->d.seclabel.address;
 
 					/*
 					 * If an object was dropped in the same command we may end
