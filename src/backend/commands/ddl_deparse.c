@@ -58,6 +58,8 @@
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_publication_rel.h"
+#include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_sequence.h"
@@ -70,6 +72,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
+#include "commands/publicationcmds.h"
 #include "commands/sequence.h"
 #include "commands/tablespace.h"
 #include "foreign/foreign.h"
@@ -151,6 +154,7 @@ bool		verbose = true;
 
 static void append_array_object(ObjTree *tree, char *sub_fmt, List *array);
 static void append_bool_object(ObjTree *tree, char *sub_fmt, bool value);
+static void append_float_object(ObjTree *tree, char *sub_fmt, float8 value);
 static void append_null_object(ObjTree *tree, char *sub_fmt);
 static void append_object_object(ObjTree *tree, char *sub_fmt, ObjTree *value);
 static char *append_object_to_format_string(ObjTree *tree, char *sub_fmt);
@@ -160,10 +164,14 @@ static void append_string_object(ObjTree *tree, char *sub_fmt, char *name,
 static void format_type_detailed(Oid type_oid, int32 typemod,
 								 Oid *nspid, char **typname, char **typemodstr,
 								 bool *typarray);
+static List *FunctionGetDefaults(text *proargdefaults);
 static ObjElem *new_object(ObjType type, char *name);
 static ObjTree *new_objtree_for_qualname_id(Oid classId, Oid objectId);
+static ObjTree *new_objtree_for_rolespec(RoleSpec *spec);
 static ObjElem *new_object_object(ObjTree *value);
 static ObjTree *new_objtree_VA(char *fmt, int numobjs,...);
+static ObjTree *new_objtree(char *fmt);
+static ObjElem *new_string_object(char *value);
 static JsonbValue *objtree_to_jsonb_rec(ObjTree *tree, JsonbParseState *state);
 static void pg_get_indexdef_detailed(Oid indexrelid,
 									 char **index_am,
@@ -178,8 +186,18 @@ static ObjTree *deparse_ColumnDef(Relation relation, List *dpcontext, bool compo
 								  ColumnDef *coldef, bool is_alter, List **exprs);
 static ObjTree *deparse_ColumnIdentity(Oid seqrelid, char identity, bool alter_table);
 static ObjTree *deparse_ColumnSetOptions(AlterTableCmd *subcmd);
+static ObjTree *deparse_DefineStmt_Aggregate(Oid objectId, DefineStmt *define);
+static ObjTree *deparse_DefineStmt_Collation(Oid objectId, DefineStmt *define,
+											 ObjectAddress fromCollid);
+static ObjTree *deparse_DefineStmt_Operator(Oid objectId, DefineStmt *define);
+static ObjTree *deparse_DefineStmt_Type(Oid objectId, DefineStmt *define);
+static ObjTree *deparse_DefineStmt_TSConfig(Oid objectId, DefineStmt *define, ObjectAddress copied);
+static ObjTree *deparse_DefineStmt_TSParser(Oid objectId, DefineStmt *define);
+static ObjTree *deparse_DefineStmt_TSDictionary(Oid objectId, DefineStmt *define);
+static ObjTree *deparse_DefineStmt_TSTemplate(Oid objectId, DefineStmt *define);
 
 static ObjTree *deparse_DefElem(DefElem *elem, bool is_reset);
+static ObjTree *deparse_FunctionSet(VariableSetKind kind, char *name, char *value);
 static ObjTree *deparse_OnCommitClause(OnCommitAction option);
 static ObjTree *deparse_RelSetOptions(AlterTableCmd *subcmd);
 
@@ -188,6 +206,7 @@ static inline ObjElem *deparse_Seq_Cycle(Form_pg_sequence seqdata, bool alter_ta
 static inline ObjElem *deparse_Seq_IncrementBy(Form_pg_sequence seqdata, bool alter_table);
 static inline ObjElem *deparse_Seq_Minvalue(Form_pg_sequence seqdata, bool alter_table);
 static inline ObjElem *deparse_Seq_Maxvalue(Form_pg_sequence seqdata, bool alter_table);
+static ObjElem *deparse_Seq_OwnedBy(Oid sequenceId, bool alter_table);
 static inline ObjElem *deparse_Seq_Restart(int64 last_value);
 static inline ObjElem *deparse_Seq_Startwith(Form_pg_sequence seqdata, bool alter_table);
 static inline ObjElem *deparse_Seq_As(Form_pg_sequence seqdata);
@@ -199,9 +218,14 @@ static inline ObjElem *deparse_Type_Typmod_Out(Form_pg_type typForm);
 static inline ObjElem *deparse_Type_Analyze(Form_pg_type typForm);
 static inline ObjElem *deparse_Type_Subscript(Form_pg_type typForm);
 
+static ObjTree *deparse_FdwOptions(List *options, char *colname,
+								   bool altercoloptions);
+
 static List *deparse_InhRelations(Oid objectId);
 static List *deparse_TableElements(Relation relation, List *tableElements, List *dpcontext,
 								   bool typed, bool composite);
+
+static char *DomainGetDefault(HeapTuple domTup, bool missing_ok);
 
 /*
  * Append present as false to a tree.
@@ -210,6 +234,42 @@ static void
 append_not_present(ObjTree *tree)
 {
 	append_bool_object(tree, "present", false);
+}
+
+/*
+ * Append an int32 parameter to a tree.
+ */
+static void
+append_int_object(ObjTree *tree, char *sub_fmt, int32 value)
+{
+	ObjElem    *param;
+	char	   *object_name;
+
+	Assert(sub_fmt);
+
+	object_name = append_object_to_format_string(tree, sub_fmt);
+
+	param = new_object(ObjTypeInteger, object_name);
+	param->value.flt = value;
+	append_premade_object(tree, param);
+}
+
+/*
+ * Append a float8 parameter to a tree.
+ */
+static void
+append_float_object(ObjTree *tree, char *sub_fmt, float8 value)
+{
+	ObjElem    *param;
+	char	   *object_name;
+
+	Assert(sub_fmt);
+
+	object_name = append_object_to_format_string(tree, sub_fmt);
+
+	param = new_object(ObjTypeFloat, object_name);
+	param->value.flt = value;
+	append_premade_object(tree, param);
 }
 
 /*
@@ -419,6 +479,34 @@ append_string_object(ObjTree *tree, char *sub_fmt, char * object_name,
 }
 
 /*
+ * Append a NULL-or-quoted-literal clause.  Useful for COMMENT and SECURITY
+ * LABEL.
+ *
+ * Verbose syntax
+ * %{null}s %{literal}s
+ */
+static void
+append_literal_or_null(ObjTree *parent, char *elemname, char *value)
+{
+	ObjTree    *top;
+	ObjTree    *part;
+
+	top = new_objtree("");
+	part = new_objtree_VA("NULL", 1,
+						  "present", ObjTypeBool, !value);
+	append_object_object(top, "%{null}s", part);
+
+	part = new_objtree_VA("", 1,
+						  "present", ObjTypeBool, value != NULL);
+
+	if (value)
+		append_string_object(part, "%{value}L", "value", value);
+	append_object_object(top, "%{literal}s", part);
+
+	append_object_object(parent, elemname, top);
+}
+
+/*
  * Similar to format_type_extended, except we return each bit of information
  * separately:
  *
@@ -518,6 +606,31 @@ format_type_detailed(Oid type_oid, int32 typemod,
 		*typemodstr = pstrdup("");
 
 	ReleaseSysCache(tuple);
+}
+
+/*
+ * Return the default values of arguments to a function, as a list of
+ * deparsed expressions.
+ */
+static List *
+FunctionGetDefaults(text *proargdefaults)
+{
+	List	   *nodedefs;
+	List	   *strdefs = NIL;
+	ListCell   *cell;
+
+	nodedefs = (List *) stringToNode(text_to_cstring(proargdefaults));
+	if (!IsA(nodedefs, List))
+		elog(ERROR, "proargdefaults is not a list");
+
+	foreach(cell, nodedefs)
+	{
+		Node	   *onedef = lfirst(cell);
+
+		strdefs = lappend(strdefs, deparse_expression(onedef, NIL, false, false));
+	}
+
+	return strdefs;
 }
 
 /*
@@ -710,6 +823,57 @@ new_objtree_for_type(Oid typeId, int32 typmod)
 }
 
 /*
+ * Helper routine for %{}R objects, with role specified by RoleSpec node.
+ * Special values such as ROLESPEC_CURRENT_USER are expanded to their final
+ * names.
+ */
+static ObjTree *
+new_objtree_for_rolespec(RoleSpec *spec)
+{
+	char	   *roletype;
+
+	if (spec->roletype != ROLESPEC_PUBLIC)
+		roletype = get_rolespec_name(spec);
+	else
+		roletype = pstrdup("");
+
+	return new_objtree_VA(NULL, 2,
+						  "is_public", ObjTypeBool, spec->roletype == ROLESPEC_PUBLIC,
+						  "rolename", ObjTypeString, roletype);
+}
+
+/*
+ * Helper routine for %{}R objects, with role specified by OID. (ACL_ID_PUBLIC
+ * means to use "public").
+ */
+static ObjTree *
+new_objtree_for_role_id(Oid roleoid)
+{
+	ObjTree    *role;
+
+	if (roleoid != ACL_ID_PUBLIC)
+	{
+		HeapTuple	roltup;
+		char	   *role_name;
+
+		roltup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleoid));
+		if (!HeapTupleIsValid(roltup))
+			elog(ERROR, "cache lookup failed for role with OID %u", roleoid);
+
+		role_name = NameStr(((Form_pg_authid) GETSTRUCT(roltup))->rolname);
+		role = new_objtree_VA("%{rolename}I", 1,
+							  "rolename", ObjTypeString, pstrdup(role_name));
+
+		ReleaseSysCache(roltup);
+	}
+	else
+		role = new_objtree_VA("%{rolename}I", 1,
+							  "rolename", ObjTypeString, "public");
+
+	return role;
+}
+
+/*
  * Allocate a new object tree to store parameter values -- varargs version.
  *
  * The "fmt" argument is used to append as a "fmt" element in the output blob.
@@ -784,6 +948,22 @@ new_objtree_VA(char *fmt, int numobjs,...)
 
 	va_end(args);
 	return tree;
+}
+
+/*
+ * Allocate a new string object.
+ */
+static ObjElem *
+new_string_object(char *value)
+{
+	ObjElem    *param;
+
+	Assert(value);
+
+	param = new_object(ObjTypeString, NULL);
+	param->value.string = value;
+
+	return param;
 }
 
 /*
@@ -1922,6 +2102,83 @@ deparse_Seq_Minvalue(Form_pg_sequence seqdata, bool alter_table)
 }
 
 /*
+ * Deparse the sequence OWNED BY command.
+ *
+ * Verbose syntax
+ * OWNED BY %{owner}D
+ */
+static ObjElem *
+deparse_Seq_OwnedBy(Oid sequenceId, bool alter_table)
+{
+	ObjTree    *ret = NULL;
+	Relation	depRel;
+	SysScanDesc scan;
+	ScanKeyData keys[3];
+	HeapTuple	tuple;
+
+	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyInit(&keys[0],
+				Anum_pg_depend_classid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationRelationId));
+	ScanKeyInit(&keys[1],
+				Anum_pg_depend_objid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(sequenceId));
+	ScanKeyInit(&keys[2],
+				Anum_pg_depend_objsubid,
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum(0));
+
+	scan = systable_beginscan(depRel, DependDependerIndexId, true,
+							  NULL, 3, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Oid			ownerId;
+		Form_pg_depend depform;
+		ObjTree    *tmp_obj;
+		char	   *colname;
+
+		depform = (Form_pg_depend) GETSTRUCT(tuple);
+
+		/* Only consider AUTO dependencies on pg_class */
+		if (depform->deptype != DEPENDENCY_AUTO)
+			continue;
+		if (depform->refclassid != RelationRelationId)
+			continue;
+		if (depform->refobjsubid <= 0)
+			continue;
+
+		ownerId = depform->refobjid;
+		colname = get_attname(ownerId, depform->refobjsubid, false);
+		if (colname == NULL)
+			continue;
+
+		tmp_obj = new_objtree_for_qualname_id(RelationRelationId, ownerId);
+		append_string_object(tmp_obj, "attrname", "attrname", colname);
+		ret = new_objtree_VA("OWNED BY %{owner}D", 2,
+							 "clause", ObjTypeString, "owned",
+							 "owner", ObjTypeObject, tmp_obj);
+	}
+
+	systable_endscan(scan);
+	relation_close(depRel, AccessShareLock);
+
+	/*
+	 * If there's no owner column, emit an empty OWNED BY element, set up so
+	 * that it won't print anything.
+	 */
+	if (!ret)
+		/* XXX this shouldn't happen ... */
+		ret = new_objtree_VA("OWNED BY %{owner}D", 3,
+							 "clause", ObjTypeString, "owned",
+							 "owner", ObjTypeNull,
+							 "present", ObjTypeBool, false);
+
+	return new_object_object(ret);
+}
+
+/*
  * Deparse the sequence RESTART option.
  *
  * Verbose syntax
@@ -2588,7 +2845,7 @@ deparse_AlterRelation(CollectedCommand *cmd)
 
 	Assert(cmd->type == SCT_AlterTable);
 	stmt = (AlterTableStmt *) cmd->parsetree;
-	Assert(IsA(stmt, AlterTableStmt));
+	Assert(IsA(stmt, AlterTableStmt) || IsA(stmt, ViewStmt));
 
 	/*
 	 * ALTER TABLE subcommands generated for TableLikeClause is processed in
@@ -3064,13 +3321,12 @@ deparse_AlterRelation(CollectedCommand *cmd)
 				}
 				break;
 
-#ifdef TODOLIST
 			case AT_AlterColumnGenericOptions:
 				tmp_obj = deparse_FdwOptions((List *) subcmd->def,
-											subcmd->name);
+											subcmd->name, true);
 				subcmds = lappend(subcmds, new_object_object(tmp_obj));
 				break;
-#endif
+
 			case AT_ChangeOwner:
 				tmp_obj = new_objtree_VA("OWNER TO %{owner}I", 2,
 										"type", ObjTypeString, "change owner",
@@ -3462,6 +3718,6111 @@ deparse_drop_command(const char *objidentity, const char *objecttype,
 }
 
 /*
+ * Deparse an AlterCollationStmt (ALTER COLLATION)
+ *
+ * Given a collation OID and the parse tree that created it, return an ObjTree
+ * representing the alter command.
+ *
+ * Verbose syntax:
+ * ALTER COLLATION %{identity}O REFRESH VERSION
+ */
+static ObjTree *
+deparse_AlterCollation(Oid objectId, Node *parsetree)
+{
+	ObjTree    *ret;
+	HeapTuple	colTup;
+	Form_pg_collation colForm;
+
+	colTup = SearchSysCache1(COLLOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(colTup))
+		elog(ERROR, "cache lookup failed for collation with OID %u", objectId);
+	colForm = (Form_pg_collation) GETSTRUCT(colTup);
+
+	ret = new_objtree_VA("ALTER COLLATION %{identity}O REFRESH VERSION", 1,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(colForm->collnamespace,
+												  NameStr(colForm->collname)));
+
+	ReleaseSysCache(colTup);
+
+	return ret;
+}
+
+/*
+ * Handle deparsing setting of Function
+ *
+ * Verbose syntax
+ * RESET ALL
+ * OR
+ * SET %{set_name}I TO %{set_value}s
+ * OR
+ * RESET %{set_name}I
+ */
+static ObjTree *
+deparse_FunctionSet(VariableSetKind kind, char *name, char *value)
+{
+	ObjTree    *ret;
+
+	if (kind == VAR_RESET_ALL)
+		ret = new_objtree("RESET ALL");
+	else if (kind == VAR_SET_VALUE)
+	{
+		ret = new_objtree_VA("SET %{set_name}I", 1,
+							 "set_name", ObjTypeString, name);
+
+		/*
+		 * Some GUC variable names are 'LIST' type and hence must not be
+		 * quoted.
+		 */
+		if (GetConfigOptionFlags(name, true) & GUC_LIST_QUOTE)
+			append_string_object(ret, "TO %{set_value}s", "set_value", value);
+		else
+			append_string_object(ret, "TO %{set_value}L", "set_value", value);
+	}
+	else
+		ret = new_objtree_VA("RESET %{set_name}I", 1,
+							 "set_name", ObjTypeString, name);
+
+	return ret;
+}
+
+/*
+ * Deparse an AlterFunctionStmt (ALTER FUNCTION/ROUTINE/PROCEDURE)
+ *
+ * Given a function OID and the parse tree that created it, return an ObjTree
+ * representing the alter command.
+ *
+ * Verbose syntax:
+ * ALTER FUNCTION/ROUTINE/PROCEDURE %{signature}s %{definition: }s
+ */
+static ObjTree *
+deparse_AlterFunction(Oid objectId, Node *parsetree)
+{
+	AlterFunctionStmt *node = (AlterFunctionStmt *) parsetree;
+	ObjTree    *ret;
+	ObjTree    *sign;
+	HeapTuple	procTup;
+	Form_pg_proc procForm;
+	List	   *params = NIL;
+	List	   *elems = NIL;
+	ListCell   *cell;
+	int			i;
+
+	/* Get the pg_proc tuple */
+	procTup = SearchSysCache1(PROCOID, objectId);
+	if (!HeapTupleIsValid(procTup))
+		elog(ERROR, "cache lookup failed for function with OID %u", objectId);
+	procForm = (Form_pg_proc) GETSTRUCT(procTup);
+
+	if (procForm->prokind == PROKIND_PROCEDURE)
+		ret = new_objtree("ALTER PROCEDURE");
+	else
+		ret = new_objtree(node->objtype == OBJECT_ROUTINE ?
+						  "ALTER ROUTINE" : "ALTER FUNCTION");
+
+	/*
+	 * ALTER FUNCTION does not change signature so we can use catalog to get
+	 * input type Oids.
+	 */
+	for (i = 0; i < procForm->pronargs; i++)
+	{
+		ObjTree    *tmp_obj;
+
+		tmp_obj = new_objtree_VA("%{type}T", 1,
+								"type", ObjTypeObject,
+								new_objtree_for_type(procForm->proargtypes.values[i], -1));
+		params = lappend(params, new_object_object(tmp_obj));
+	}
+
+	sign = new_objtree_VA("%{identity}D (%{arguments:, }s)", 2,
+						  "identity", ObjTypeObject,
+						  new_objtree_for_qualname_id(ProcedureRelationId, objectId),
+						  "arguments", ObjTypeArray, params);
+
+	append_object_object(ret, "%{signature}s", sign);
+
+	foreach(cell, node->actions)
+	{
+		DefElem    *defel = (DefElem *) lfirst(cell);
+		ObjTree    *tmp_obj = NULL;
+
+		if (strcmp(defel->defname, "volatility") == 0)
+			tmp_obj = new_objtree(strVal(defel->arg));
+		else if (strcmp(defel->defname, "strict") == 0)
+			tmp_obj = new_objtree(boolVal(defel->arg) ?
+								 "RETURNS NULL ON NULL INPUT" :
+								 "CALLED ON NULL INPUT");
+		else if (strcmp(defel->defname, "security") == 0)
+			tmp_obj = new_objtree(boolVal(defel->arg) ?
+								 "SECURITY DEFINER" : "SECURITY INVOKER");
+		else if (strcmp(defel->defname, "leakproof") == 0)
+			tmp_obj = new_objtree(boolVal(defel->arg) ?
+								 "LEAKPROOF" : "NOT LEAKPROOF");
+		else if (strcmp(defel->defname, "cost") == 0)
+			tmp_obj = new_objtree_VA("COST %{cost}n", 1,
+									"cost", ObjTypeFloat,
+									defGetNumeric(defel));
+		else if (strcmp(defel->defname, "rows") == 0)
+		{
+			tmp_obj = new_objtree("ROWS");
+			if (defGetNumeric(defel) == 0)
+				append_not_present(tmp_obj);
+			else
+				append_float_object(tmp_obj, "%{rows}n",
+									defGetNumeric(defel));
+		}
+		else if (strcmp(defel->defname, "set") == 0)
+		{
+			VariableSetStmt *sstmt = (VariableSetStmt *) defel->arg;
+			char	   *value = ExtractSetVariableArgs(sstmt);
+
+			tmp_obj = deparse_FunctionSet(sstmt->kind, sstmt->name, value);
+		}
+		else if (strcmp(defel->defname, "support") == 0)
+		{
+			Oid			argtypes[1];
+
+			tmp_obj = new_objtree("SUPPORT");
+
+			Assert(procForm->prosupport);
+
+			/*
+			 * We should qualify the support function's name if it wouldn't be
+			 * resolved by lookup in the current search path.
+			 */
+			argtypes[0] = INTERNALOID;
+			append_string_object(tmp_obj, "%{name}s", "name",
+								 generate_function_name(procForm->prosupport, 1,
+														NIL, argtypes,
+														false, NULL,
+														EXPR_KIND_NONE));
+		}
+		else if (strcmp(defel->defname, "parallel") == 0)
+			tmp_obj = new_objtree_VA("PARALLEL %{value}s", 1,
+									"value", ObjTypeString, strVal(defel->arg));
+
+		elems = lappend(elems, new_object_object(tmp_obj));
+	}
+
+	append_array_object(ret, "%{definition: }s", elems);
+
+	ReleaseSysCache(procTup);
+
+	return ret;
+}
+
+/*
+ * Deparse an AlterObjectSchemaStmt (ALTER ... SET SCHEMA command)
+ *
+ * Given the object address and the parse tree that created it, return an
+ * ObjTree representing the alter command.
+ *
+ * Verbose syntax
+ * ALTER %s %{identity}s SET SCHEMA %{newschema}I
+ */
+static ObjTree *
+deparse_AlterObjectSchemaStmt(ObjectAddress address, Node *parsetree,
+							  ObjectAddress old_schema)
+{
+	AlterObjectSchemaStmt *node = (AlterObjectSchemaStmt *) parsetree;
+	char	   *identity;
+	char	   *new_schema = node->newschema;
+	char	   *old_schname;
+	char	   *ident;
+
+	/*
+	 * Since the command has already taken place from the point of view of
+	 * catalogs, getObjectIdentity returns the object name with the already
+	 * changed schema.  The output of our deparsing must return the original
+	 * schema name, however, so we chop the schema name off the identity
+	 * string and then prepend the quoted schema name.
+	 *
+	 * XXX This is pretty clunky. Can we do better?
+	 */
+	identity = getObjectIdentity(&address, false);
+	old_schname = get_namespace_name(old_schema.objectId);
+	if (!old_schname)
+		elog(ERROR, "cache lookup failed for schema with OID %u",
+			 old_schema.objectId);
+
+	ident = psprintf("%s%s", quote_identifier(old_schname),
+					 identity + strlen(quote_identifier(new_schema)));
+
+	return new_objtree_VA("ALTER %{objtype}s %{identity}s SET SCHEMA %{newschema}I", 3,
+						  "objtype", ObjTypeString,
+						  stringify_objtype(node->objectType, false),
+						  "identity", ObjTypeString, ident,
+						  "newschema", ObjTypeString, new_schema);
+}
+
+/*
+ * Deparse a GRANT/REVOKE command.
+ *
+ * Verbose syntax
+ * GRANT %{privileges:, }s ON" %{objtype}s %{privtarget:, }s TO %{grantees:, }s
+ * %{grant_option}s GRANTED BY %{rolename}s
+ * 		OR
+ * REVOKE %{privileges:, }s ON" %{objtype}s %{privtarget:, }s
+ * FROM %{grantees:, }s %{grant_option}s %{cascade}s
+ */
+static ObjTree *
+deparse_GrantStmt(CollectedCommand *cmd)
+{
+	InternalGrant *istmt;
+	ObjTree    *ret;
+	List	   *list = NIL;
+	ListCell   *cell;
+	Oid			classId;
+	ObjTree    *tmp;
+
+	/* Don't deparse SQL commands generated while creating extension */
+	if (cmd->in_extension)
+		return NULL;
+
+	istmt = cmd->d.grant.istmt;
+
+	/*
+	 * If there are no objects from "ALL ... IN SCHEMA" to be granted, then
+	 * nothing to do.
+	 */
+	if (istmt->objects == NIL)
+		return NULL;
+
+	switch (istmt->objtype)
+	{
+		case OBJECT_COLUMN:
+		case OBJECT_TABLE:
+		case OBJECT_SEQUENCE:
+			classId = RelationRelationId;
+			break;
+		case OBJECT_DOMAIN:
+		case OBJECT_TYPE:
+			classId = TypeRelationId;
+			break;
+		case OBJECT_FDW:
+			classId = ForeignDataWrapperRelationId;
+			break;
+		case OBJECT_FOREIGN_SERVER:
+			classId = ForeignServerRelationId;
+			break;
+		case OBJECT_FUNCTION:
+		case OBJECT_PROCEDURE:
+		case OBJECT_ROUTINE:
+			classId = ProcedureRelationId;
+			break;
+		case OBJECT_LANGUAGE:
+			classId = LanguageRelationId;
+			break;
+		case OBJECT_LARGEOBJECT:
+			classId = LargeObjectRelationId;
+			break;
+		case OBJECT_SCHEMA:
+			classId = NamespaceRelationId;
+			break;
+		case OBJECT_DATABASE:
+		case OBJECT_TABLESPACE:
+			classId = InvalidOid;
+			elog(ERROR, "global objects not supported");
+			break;
+		default:
+			elog(ERROR, "invalid OBJECT value %d", istmt->objtype);
+	}
+
+	/* GRANT TO or REVOKE FROM */
+	ret = new_objtree(istmt->is_grant ? "GRANT" : "REVOKE");
+
+	/* Build a list of privileges to grant/revoke */
+	if (istmt->all_privs)
+	{
+		tmp = new_objtree("ALL PRIVILEGES");
+		list = list_make1(new_object_object(tmp));
+	}
+	else
+	{
+		char *priv;
+		if (istmt->privileges & ACL_INSERT)
+		{
+			priv = (char *)privilege_to_string(ACL_INSERT);
+			list = lappend(list, new_string_object(priv));
+		}
+		if (istmt->privileges & ACL_SELECT)
+		{
+			priv = (char *)privilege_to_string(ACL_SELECT);
+			list = lappend(list, new_string_object(priv));
+		}
+		if (istmt->privileges & ACL_UPDATE)
+		{
+			priv = (char *)privilege_to_string(ACL_UPDATE);
+			list = lappend(list, new_string_object(priv));
+		}
+		if (istmt->privileges & ACL_DELETE)
+		{
+			priv = (char *)privilege_to_string(ACL_DELETE);
+			list = lappend(list, new_string_object(priv));
+		}
+		if (istmt->privileges & ACL_TRUNCATE)
+		{
+			priv = (char *)privilege_to_string(ACL_TRUNCATE);
+			list = lappend(list, new_string_object(priv));
+		}
+		if (istmt->privileges & ACL_REFERENCES)
+		{
+			priv = (char *)privilege_to_string(ACL_REFERENCES);
+			list = lappend(list, new_string_object(priv));
+		}
+		if (istmt->privileges & ACL_TRIGGER)
+		{
+			priv = (char *)privilege_to_string(ACL_TRIGGER);
+			list = lappend(list, new_string_object(priv));
+		}
+		if (istmt->privileges & ACL_EXECUTE)
+		{
+			priv = (char *)privilege_to_string(ACL_EXECUTE);
+			list = lappend(list, new_string_object(priv));
+		}
+		if (istmt->privileges & ACL_USAGE)
+		{
+			priv = (char *)privilege_to_string(ACL_USAGE);
+			list = lappend(list, new_string_object(priv));
+		}
+		if (istmt->privileges & ACL_CREATE)
+		{
+			priv = (char *)privilege_to_string(ACL_CREATE);
+			list = lappend(list, new_string_object(priv));
+		}
+		if (istmt->privileges & ACL_CREATE_TEMP)
+		{
+			priv = (char *)privilege_to_string(ACL_CREATE_TEMP);
+			list = lappend(list, new_string_object(priv));
+		}
+		if (istmt->privileges & ACL_CONNECT)
+		{
+			priv = (char *)privilege_to_string(ACL_CONNECT);
+			list = lappend(list, new_string_object(priv));
+		}
+		if (istmt->privileges & ACL_MAINTAIN)
+		{
+			priv = (char *)privilege_to_string(ACL_MAINTAIN);
+			list = lappend(list, new_string_object(priv));
+		}
+
+		if (!istmt->is_grant && istmt->grant_option)
+			append_string_object(ret, "%{grant_option}s", "grant_option",
+								 istmt->grant_option ? "GRANT OPTION FOR" : "");
+
+		if (istmt->col_privs != NIL)
+		{
+			ListCell   *ocell;
+
+			foreach(ocell, istmt->col_privs)
+			{
+				AccessPriv *priv = lfirst(ocell);
+				List	   *cols = NIL;
+
+				foreach(cell, priv->cols)
+				{
+					String	   *colname = lfirst_node(String, cell);
+
+					cols = lappend(cols,
+								   new_string_object(strVal(colname)));
+				}
+
+				tmp = new_objtree_VA("(%{cols:, }s) %{priv}s", 2,
+									 "cols", ObjTypeArray, cols,
+									 "priv", ObjTypeString,
+									  priv->priv_name ? priv->priv_name : "ALL PRIVILEGES");
+
+				list = lappend(list, new_object_object(tmp));
+			}
+		}
+	}
+	append_array_object(ret, "%{privileges:, }s ON", list);
+
+	append_string_object(ret, "%{objtype}s", "objtype",
+						 (char *)stringify_objtype(istmt->objtype, true));
+
+	/* Target objects.  We use object identities here */
+	list = NIL;
+	foreach(cell, istmt->objects)
+	{
+		Oid			objid = lfirst_oid(cell);
+		ObjectAddress addr;
+
+		addr.classId = classId;
+		addr.objectId = objid;
+		addr.objectSubId = 0;
+
+		tmp = new_objtree_VA("%{identity}s", 1,
+							 "identity", ObjTypeString,
+							 getObjectIdentity(&addr, false));
+
+		list = lappend(list, new_object_object(tmp));
+	}
+	append_array_object(ret, "%{privtarget:, }s", list);
+
+	append_format_string(ret, istmt->is_grant ? "TO" : "FROM");
+
+	/* List of grantees */
+	list = NIL;
+	foreach(cell, istmt->grantees)
+	{
+		Oid			grantee = lfirst_oid(cell);
+
+		tmp = new_objtree_for_role_id(grantee);
+		list = lappend(list, new_object_object(tmp));
+	}
+
+	append_array_object(ret, "%{grantees:, }s", list);
+
+	/* The wording of the grant option is variable ... */
+	if (istmt->is_grant)
+		append_string_object(ret, "%{grant_option}s", "grant_option",
+							 istmt->grant_option ? "WITH GRANT OPTION" : "");
+
+	if (istmt->grantor_uid)
+	{
+		HeapTuple	roltup;
+		char	   *rolename;
+
+		roltup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(istmt->grantor_uid));
+		if (!HeapTupleIsValid(roltup))
+			elog(ERROR, "cache lookup failed for role with OID %u",
+				 istmt->grantor_uid);
+
+		rolename = NameStr(((Form_pg_authid) GETSTRUCT(roltup))->rolname);
+		append_string_object(ret, "GRANTED BY %{rolename}s",
+							 "rolename", rolename);
+		ReleaseSysCache(roltup);
+	}
+
+	if (!istmt->is_grant)
+		append_string_object(ret, "%{cascade}s", "cascade",
+							 istmt->behavior == DROP_CASCADE ? "CASCADE" : "");
+
+	return ret;
+}
+
+/*
+ * Deparse an AlterOperatorStmt (ALTER OPERATOR ... SET ...).
+ *
+ * Given an operator OID and the parse tree that created it, return an ObjTree
+ * representing the alter command.
+ *
+ * Verbose syntax
+ * ALTER OPERATOR %{identity}O (%{left_type}T, %{right_type}T)
+ * SET (%{elems:, }s)
+ */
+static ObjTree *
+deparse_AlterOperatorStmt(Oid objectId, Node *parsetree)
+{
+	HeapTuple	oprTup;
+	AlterOperatorStmt *node = (AlterOperatorStmt *) parsetree;
+	ObjTree    *ret;
+	Form_pg_operator oprForm;
+	ListCell   *cell;
+	List	   *list = NIL;
+
+	oprTup = SearchSysCache1(OPEROID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(oprTup))
+		elog(ERROR, "cache lookup failed for operator with OID %u", objectId);
+	oprForm = (Form_pg_operator) GETSTRUCT(oprTup);
+
+	ret = new_objtree_VA("ALTER OPERATOR %{identity}O", 1,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(oprForm->oprnamespace,
+												  NameStr(oprForm->oprname)));
+
+	/* LEFTARG */
+	if (OidIsValid(oprForm->oprleft))
+		append_object_object(ret, "(%{left_type}T",
+							 new_objtree_for_type(oprForm->oprleft, -1));
+	else
+		append_string_object(ret, "(%{left_type}s", "left_type", "NONE");
+
+	/* RIGHTARG */
+	Assert(OidIsValid(oprForm->oprleft));
+	append_object_object(ret, ", %{right_type}T)",
+						 new_objtree_for_type(oprForm->oprright, -1));
+
+	foreach(cell, node->options)
+	{
+		DefElem    *elem = (DefElem *) lfirst(cell);
+		ObjTree    *tmp_obj = NULL;
+
+		if (strcmp(elem->defname, "restrict") == 0)
+		{
+			tmp_obj = new_objtree_VA("RESTRICT=", 1,
+									"clause", ObjTypeString, "restrict");
+			if (OidIsValid(oprForm->oprrest))
+				append_object_object(tmp_obj, "%{procedure}D",
+									 new_objtree_for_qualname_id(ProcedureRelationId,
+																 oprForm->oprrest));
+			else
+				append_string_object(tmp_obj, "%{procedure}s", "procedure",
+									 "NONE");
+		}
+		else if (strcmp(elem->defname, "join") == 0)
+		{
+			tmp_obj = new_objtree_VA("JOIN=", 1,
+									"clause", ObjTypeString, "join");
+			if (OidIsValid(oprForm->oprjoin))
+				append_object_object(tmp_obj, "%{procedure}D",
+									 new_objtree_for_qualname_id(ProcedureRelationId,
+																 oprForm->oprjoin));
+			else
+				append_string_object(tmp_obj, "%{procedure}s", "procedure",
+									 "NONE");
+		}
+
+		Assert(tmp_obj);
+		list = lappend(list, new_object_object(tmp_obj));
+	}
+
+	append_array_object(ret, "SET (%{elems:, }s)", list);
+
+	ReleaseSysCache(oprTup);
+
+	return ret;
+}
+
+/*
+ * Deparse an ALTER OPERATOR FAMILY ADD/DROP command.
+ *
+ * Given the CollectedCommand, return an ObjTree representing the Alter
+ * Operator command.
+ *
+ * Verbose syntax
+ * ALTER OPERATOR FAMILY %{identity}D USING %{amname}I ADD/DROP %{items:,}s
+ */
+static ObjTree *
+deparse_AlterOpFamily(CollectedCommand *cmd)
+{
+	ObjTree    *ret;
+	AlterOpFamilyStmt *stmt = (AlterOpFamilyStmt *) cmd->parsetree;
+	HeapTuple	ftp;
+	Form_pg_opfamily opfForm;
+	List	   *list = NIL;
+	ListCell   *cell;
+
+	/* Don't deparse SQL commands generated while creating extension */
+	if (cmd->in_extension)
+		return NULL;
+
+	ftp = SearchSysCache1(OPFAMILYOID,
+						  ObjectIdGetDatum(cmd->d.opfam.address.objectId));
+	if (!HeapTupleIsValid(ftp))
+		elog(ERROR, "cache lookup failed for operator family with OID %u",
+			 cmd->d.opfam.address.objectId);
+	opfForm = (Form_pg_opfamily) GETSTRUCT(ftp);
+
+	ret = new_objtree_VA("ALTER OPERATOR FAMILY %{identity}D USING %{amname}I", 2,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(opfForm->opfnamespace,
+												  NameStr(opfForm->opfname)),
+						 "amname", ObjTypeString, stmt->amname);
+
+	foreach(cell, cmd->d.opfam.operators)
+	{
+		OpFamilyMember *oper = lfirst(cell);
+		ObjTree    *tmp_obj;
+
+		/*
+		 * Verbose syntax
+		 *
+		 * OPERATOR %{num}n %{operator}O(%{ltype}T, %{rtype}T) %{purpose}s
+		 */
+		tmp_obj = new_objtree_VA("OPERATOR %{num}n", 1,
+								"num", ObjTypeInteger, oper->number);
+
+		/* Add the operator name; the DROP case doesn't have this */
+		if (!stmt->isDrop)
+			append_object_object(tmp_obj, "%{operator}O",
+								 new_objtree_for_qualname_id(OperatorRelationId,
+															 oper->object));
+
+		/* Add the types */
+		append_object_object(tmp_obj, "(%{ltype}T,",
+							 new_objtree_for_type(oper->lefttype, -1));
+		append_object_object(tmp_obj, "%{rtype}T)",
+							 new_objtree_for_type(oper->righttype, -1));
+
+		/* Add the FOR SEARCH / FOR ORDER BY clause; not in the DROP case */
+		if (!stmt->isDrop)
+		{
+			if (oper->sortfamily == InvalidOid)
+				append_string_object(tmp_obj, "%{purpose}s", "purpose",
+									 "FOR SEARCH");
+			else
+			{
+				ObjTree    *orderby_obj;
+
+				orderby_obj = new_objtree_VA("FOR ORDER BY %{opfamily}D", 1,
+											"opfamily", ObjTypeObject,
+											new_objtree_for_qualname_id(OperatorFamilyRelationId,
+																		oper->sortfamily));
+				append_object_object(tmp_obj, "%{purpose}s", orderby_obj);
+			}
+		}
+
+		list = lappend(list, new_object_object(tmp_obj));
+	}
+
+	foreach(cell, cmd->d.opfam.procedures)
+	{
+		OpFamilyMember *proc = lfirst(cell);
+		ObjTree    *tmp_obj;
+
+		tmp_obj = new_objtree_VA("FUNCTION %{num}n (%{ltype}T, %{rtype}T)", 3,
+								"num", ObjTypeInteger, proc->number,
+								"ltype", ObjTypeObject,
+								new_objtree_for_type(proc->lefttype, -1),
+								"rtype", ObjTypeObject,
+								new_objtree_for_type(proc->righttype, -1));
+
+		/*
+		 * Add the function name and arg types; the DROP case doesn't have
+		 * this
+		 */
+		if (!stmt->isDrop)
+		{
+			HeapTuple	procTup;
+			Form_pg_proc procForm;
+			Oid		   *proargtypes;
+			List	   *arglist = NIL;
+			int			i;
+
+			procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(proc->object));
+			if (!HeapTupleIsValid(procTup))
+				elog(ERROR, "cache lookup failed for procedure with OID %u",
+					 proc->object);
+			procForm = (Form_pg_proc) GETSTRUCT(procTup);
+
+			proargtypes = procForm->proargtypes.values;
+			for (i = 0; i < procForm->pronargs; i++)
+			{
+				ObjTree    *arg;
+
+				arg = new_objtree_for_type(proargtypes[i], -1);
+				arglist = lappend(arglist, new_object_object(arg));
+			}
+
+			append_object_object(tmp_obj, "%{function}D",
+								 new_objtree_for_qualname(procForm->pronamespace,
+														  NameStr(procForm->proname)));
+
+			append_format_string(tmp_obj, "(");
+			append_array_object(tmp_obj, "%{argtypes:, }T", arglist);
+			append_format_string(tmp_obj, ")");
+
+			ReleaseSysCache(procTup);
+		}
+
+		list = lappend(list, new_object_object(tmp_obj));
+	}
+
+	if (stmt->isDrop)
+		append_format_string(ret, "DROP");
+	else
+		append_format_string(ret, "ADD");
+
+	append_array_object(ret, "%{items:, }s", list);
+
+	ReleaseSysCache(ftp);
+
+	return ret;
+}
+
+/*
+ * Deparse an AlterOwnerStmt (ALTER ... OWNER TO ...).
+ *
+ * Given the object address and the parse tree that created it, return an
+ * ObjTree representing the alter command.
+ *
+ * Verbose syntax
+ * ALTER %s %{identity}s OWNER TO %{newowner}I
+ */
+static ObjTree *
+deparse_AlterOwnerStmt(ObjectAddress address, Node *parsetree)
+{
+	AlterOwnerStmt *node = (AlterOwnerStmt *) parsetree;
+
+	return new_objtree_VA("ALTER %{objtype}s %{identity}s OWNER TO %{newowner}I", 3,
+						  "objtype", ObjTypeString,
+						  stringify_objtype(node->objectType, false),
+						  "identity", ObjTypeString,
+						  getObjectIdentity(&address, false),
+						  "newowner", ObjTypeString,
+						  get_rolespec_name(node->newowner));
+}
+
+/*
+ * Deparse an AlterSeqStmt.
+ *
+ * Given a sequence OID and a parse tree that modified it, return an ObjTree
+ * representing the alter command.
+ *
+ * Verbose syntax
+ * ALTER SEQUENCE %{identity}D %{definition: }s
+ */
+static ObjTree *
+deparse_AlterSeqStmt(Oid objectId, Node *parsetree)
+{
+	ObjTree    *ret;
+	Relation	relation;
+	List	   *elems = NIL;
+	ListCell   *cell;
+	Form_pg_sequence seqform;
+	Sequence_values *seqvalues;
+	AlterSeqStmt *alterSeqStmt = (AlterSeqStmt *) parsetree;
+
+	/*
+	 * Sequence for IDENTITY COLUMN output separately (via CREATE TABLE or
+	 * ALTER TABLE); return empty here.
+	 */
+	if (alterSeqStmt->for_identity)
+		return NULL;
+
+	seqvalues = get_sequence_values(objectId);
+	seqform = seqvalues->seqform;
+
+	foreach(cell, ((AlterSeqStmt *) parsetree)->options)
+	{
+		DefElem    *elem = (DefElem *) lfirst(cell);
+		ObjElem    *newelm;
+
+		if (strcmp(elem->defname, "cache") == 0)
+			newelm = deparse_Seq_Cache(seqform, false);
+		else if (strcmp(elem->defname, "cycle") == 0)
+			newelm = deparse_Seq_Cycle(seqform, false);
+		else if (strcmp(elem->defname, "increment") == 0)
+			newelm = deparse_Seq_IncrementBy(seqform, false);
+		else if (strcmp(elem->defname, "minvalue") == 0)
+			newelm = deparse_Seq_Minvalue(seqform, false);
+		else if (strcmp(elem->defname, "maxvalue") == 0)
+			newelm = deparse_Seq_Maxvalue(seqform, false);
+		else if (strcmp(elem->defname, "start") == 0)
+			newelm = deparse_Seq_Startwith(seqform, false);
+		else if (strcmp(elem->defname, "restart") == 0)
+			newelm = deparse_Seq_Restart(seqvalues->last_value);
+		else if (strcmp(elem->defname, "owned_by") == 0)
+			newelm = deparse_Seq_OwnedBy(objectId, false);
+		else if (strcmp(elem->defname, "as") == 0)
+			newelm = deparse_Seq_As(seqform);
+		else
+			elog(ERROR, "invalid sequence option %s", elem->defname);
+
+		elems = lappend(elems, newelm);
+	}
+
+	relation = relation_open(objectId, AccessShareLock);
+
+	ret = new_objtree_VA("ALTER SEQUENCE %{identity}D %{definition: }s", 2,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(relation->rd_rel->relnamespace,
+												  RelationGetRelationName(relation)),
+						 "definition", ObjTypeArray, elems);
+
+	relation_close(relation, AccessShareLock);
+
+	return ret;
+}
+
+/*
+ * Deparse an AlterTypeStmt.
+ *
+ * Given a type OID and a parse tree that modified it, return an ObjTree
+ * representing the alter type.
+ *
+ * Verbose syntax
+ * ALTER TYPE %{identity}D (%{definition: }s)
+ */
+static ObjTree *
+deparse_AlterTypeSetStmt(Oid objectId, Node *cmd)
+{
+	AlterTypeStmt *alterTypeSetStmt = (AlterTypeStmt *) cmd;
+	ListCell   *pl;
+	List	   *elems = NIL;
+	HeapTuple	typTup;
+	Form_pg_type typForm;
+
+	typTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(typTup))
+		elog(ERROR, "cache lookup failed for type with OID %u", objectId);
+	typForm = (Form_pg_type) GETSTRUCT(typTup);
+
+	foreach(pl, alterTypeSetStmt->options)
+	{
+		DefElem    *defel = (DefElem *) lfirst(pl);
+		ObjElem    *newelm;
+
+		if (strcmp(defel->defname, "storage") == 0)
+			newelm = deparse_Type_Storage(typForm);
+		else if (strcmp(defel->defname, "receive") == 0)
+			newelm = deparse_Type_Receive(typForm);
+		else if (strcmp(defel->defname, "send") == 0)
+			newelm = deparse_Type_Send(typForm);
+		else if (strcmp(defel->defname, "typmod_in") == 0)
+			newelm = deparse_Type_Typmod_In(typForm);
+		else if (strcmp(defel->defname, "typmod_out") == 0)
+			newelm = deparse_Type_Typmod_Out(typForm);
+		else if (strcmp(defel->defname, "analyze") == 0)
+			newelm = deparse_Type_Analyze(typForm);
+		else if (strcmp(defel->defname, "subscript") == 0)
+			newelm = deparse_Type_Subscript(typForm);
+		else
+			elog(ERROR, "invalid type option %s", defel->defname);
+
+		elems = lappend(elems, newelm);
+	}
+
+	ReleaseSysCache(typTup);
+
+	return new_objtree_VA("ALTER TYPE %{identity}D SET (%{definition:, }s)", 2,
+						  "identity", ObjTypeObject,
+						  new_objtree_for_qualname_id(TypeRelationId,
+													  objectId),
+						  "definition", ObjTypeArray, elems);
+}
+
+/*
+ * Deparse a CompositeTypeStmt (CREATE TYPE AS)
+ *
+ * Given a Composite type OID and the parse tree that created it, return an
+ * ObjTree representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE TYPE %{identity}D AS (%{columns:, }s)
+ */
+static ObjTree *
+deparse_CompositeTypeStmt(Oid objectId, Node *parsetree)
+{
+	CompositeTypeStmt *node = (CompositeTypeStmt *) parsetree;
+	HeapTuple	typtup;
+	Form_pg_type typform;
+	Relation	typerel;
+	List	   *dpcontext;
+	List	   *tableelts = NIL;
+
+	/* Find the pg_type entry and open the corresponding relation */
+	typtup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(typtup))
+		elog(ERROR, "cache lookup failed for type with OID %u", objectId);
+	typform = (Form_pg_type) GETSTRUCT(typtup);
+	typerel = relation_open(typform->typrelid, AccessShareLock);
+
+	dpcontext = deparse_context_for(RelationGetRelationName(typerel),
+									RelationGetRelid(typerel));
+
+	tableelts = deparse_TableElements(typerel, node->coldeflist, dpcontext,
+									  false,	/* not typed */
+									  true);	/* composite type */
+
+	table_close(typerel, AccessShareLock);
+	ReleaseSysCache(typtup);
+
+	return new_objtree_VA("CREATE TYPE %{identity}D AS (%{columns:, }s)", 2,
+						  "identity", ObjTypeObject,
+						  new_objtree_for_qualname_id(TypeRelationId, objectId),
+						  "columns", ObjTypeArray, tableelts);
+}
+
+/*
+ * Deparse a CreateConversionStmt
+ *
+ * Given a conversion OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE %{default}s CONVERSION %{identity}D FOR %{source}L TO %{dest}L
+ * FROM %{function}D
+ */
+static ObjTree *
+deparse_CreateConversion(Oid objectId, Node *parsetree)
+{
+	HeapTuple	conTup;
+	Relation	convrel;
+	Form_pg_conversion conForm;
+	ObjTree    *ret;
+
+	convrel = table_open(ConversionRelationId, AccessShareLock);
+	conTup = get_catalog_object_by_oid(convrel, Anum_pg_conversion_oid, objectId);
+	if (!HeapTupleIsValid(conTup))
+		elog(ERROR, "cache lookup failed for conversion with OID %u", objectId);
+	conForm = (Form_pg_conversion) GETSTRUCT(conTup);
+
+	ret = new_objtree_VA("CREATE %{default}s CONVERSION %{identity}D FOR %{source}L TO %{dest}L FROM %{function}D", 5,
+						  "default", ObjTypeString,
+						  conForm->condefault ? "DEFAULT" : "",
+						  "identity", ObjTypeObject,
+						  new_objtree_for_qualname(conForm->connamespace,
+												   NameStr(conForm->conname)),
+						  "source", ObjTypeString,
+						  (char *)pg_encoding_to_char(conForm->conforencoding),
+						  "dest", ObjTypeString,
+						  (char *)pg_encoding_to_char(conForm->contoencoding),
+						  "function", ObjTypeObject,
+						  new_objtree_for_qualname_id(ProcedureRelationId,
+													  conForm->conproc));
+
+	table_close(convrel, AccessShareLock);
+
+	return ret;
+}
+
+/*
+ * Deparse a CreateEnumStmt (CREATE TYPE AS ENUM)
+ *
+ * Given a Enum type OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE TYPE %{identity}D AS ENUM (%{values:, }L)
+ */
+static ObjTree *
+deparse_CreateEnumStmt(Oid objectId, Node *parsetree)
+{
+	CreateEnumStmt *node = (CreateEnumStmt *) parsetree;
+	List	   *values = NIL;
+	ListCell   *cell;
+
+	foreach(cell, node->vals)
+		values = lappend(values, new_string_object(strVal(lfirst_node(String, cell))));
+
+	return new_objtree_VA("CREATE TYPE %{identity}D AS ENUM (%{values:, }L)", 2,
+						  "identity", ObjTypeObject,
+						  new_objtree_for_qualname_id(TypeRelationId, objectId),
+						  "values", ObjTypeArray, values);
+}
+
+/*
+ * Deparse a CreateExtensionStmt
+ *
+ * Given an extension OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE EXTENSION %{if_not_exists}s %{name}I %{options: }s
+ */
+static ObjTree *
+deparse_CreateExtensionStmt(Oid objectId, Node *parsetree)
+{
+	CreateExtensionStmt *node = (CreateExtensionStmt *) parsetree;
+	Relation	pg_extension;
+	HeapTuple	extTup;
+	Form_pg_extension extForm;
+	ObjTree    *tmp;
+	List	   *list = NIL;
+	ListCell   *cell;
+
+	pg_extension = table_open(ExtensionRelationId, AccessShareLock);
+	extTup = get_catalog_object_by_oid(pg_extension, Anum_pg_extension_oid, objectId);
+	if (!HeapTupleIsValid(extTup))
+		elog(ERROR, "cache lookup failed for extension with OID %u", objectId);
+	extForm = (Form_pg_extension) GETSTRUCT(extTup);
+
+	/* List of options */
+	foreach(cell, node->options)
+	{
+		DefElem    *opt = (DefElem *) lfirst(cell);
+
+		if (strcmp(opt->defname, "schema") == 0)
+		{
+			/* Skip this one; we add one unconditionally below */
+			continue;
+		}
+		else if (strcmp(opt->defname, "new_version") == 0)
+		{
+			tmp = new_objtree_VA("VERSION %{version}L", 2,
+								 "type", ObjTypeString, "version",
+								 "version", ObjTypeString, defGetString(opt));
+			list = lappend(list, new_object_object(tmp));
+		}
+		else if (strcmp(opt->defname, "old_version") == 0)
+		{
+			tmp = new_objtree_VA("FROM %{version}L", 2,
+								 "type", ObjTypeString, "from",
+								 "version", ObjTypeString, defGetString(opt));
+			list = lappend(list, new_object_object(tmp));
+		}
+		else
+			elog(ERROR, "unsupported option %s", opt->defname);
+	}
+
+	/* Add the SCHEMA option */
+	tmp = new_objtree_VA("SCHEMA %{schema}I", 2,
+						 "type", ObjTypeString, "schema",
+						 "schema", ObjTypeString,
+						 get_namespace_name(extForm->extnamespace));
+	list = lappend(list, new_object_object(tmp));
+	table_close(pg_extension, AccessShareLock);
+
+	return new_objtree_VA("CREATE EXTENSION %{if_not_exists}s %{name}I %{options: }s", 3,
+						  "if_not_exists", ObjTypeString,
+						  node->if_not_exists ? "IF NOT EXISTS" : "",
+						  "name", ObjTypeString, node->extname,
+						  "options", ObjTypeArray, list);
+}
+
+/*
+ * If a column name is specified, add an element for it; otherwise it's a
+ * table-level option.
+ */
+static ObjTree *
+deparse_FdwOptions(List *options, char *colname, bool altercoloptions)
+{
+	ObjTree    *ret;
+
+	if (colname)
+		ret = new_objtree_VA("ALTER COLUMN %{column}I %{options}s", 2,
+							 "column", ObjTypeString, colname,
+							 "options", ObjTypeString,
+							 altercoloptions ? "OPTIONS" : "");
+	else
+		ret = new_objtree("OPTIONS");
+
+	if (options != NIL)
+	{
+		List	   *optout = NIL;
+		ListCell   *cell;
+
+		foreach(cell, options)
+		{
+			DefElem    *elem;
+			ObjTree    *opt;
+
+			elem = (DefElem *) lfirst(cell);
+
+			switch (elem->defaction)
+			{
+				case DEFELEM_UNSPEC:
+					opt = new_objtree_VA("%{label}I %{value}L", 2,
+										 "label", ObjTypeString, elem->defname,
+										 "value", ObjTypeString,
+										 elem->arg ? defGetString(elem) :
+										 defGetBoolean(elem) ? "TRUE" : "FALSE");
+					break;
+				case DEFELEM_SET:
+					opt = new_objtree_VA("SET %{label}I %{value}L", 2,
+										 "label", ObjTypeString, elem->defname,
+										 "value", ObjTypeString,
+										 elem->arg ? defGetString(elem) :
+										 defGetBoolean(elem) ? "TRUE" : "FALSE");
+					break;
+				case DEFELEM_ADD:
+					opt = new_objtree_VA("ADD %{label}I %{value}L", 2,
+										 "label", ObjTypeString, elem->defname,
+										 "value", ObjTypeString,
+										 elem->arg ? defGetString(elem) :
+										 defGetBoolean(elem) ? "TRUE" : "FALSE");
+					break;
+				case DEFELEM_DROP:
+					opt = new_objtree_VA("DROP %{label}I", 1,
+										 "label", ObjTypeString, elem->defname);
+					break;
+				default:
+					elog(ERROR, "invalid def action %d", elem->defaction);
+					opt = NULL;
+			}
+
+			optout = lappend(optout, new_object_object(opt));
+		}
+
+		append_array_object(ret, "(%{option: ,}s)", optout);
+	}
+	else
+		append_not_present(ret);
+
+	return ret;
+}
+
+/*
+ * Deparse a CreateFdwStmt (CREATE FOREIGN DATA WRAPPER)
+ *
+ * Given an FDW OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE FOREIGN DATA WRAPPER %{identity}I %{handler}s %{validator}s %{generic_options}s
+ */
+static ObjTree *
+deparse_CreateFdwStmt(Oid objectId, Node *parsetree)
+{
+	CreateFdwStmt *node = (CreateFdwStmt *) parsetree;
+	HeapTuple	fdwTup;
+	Form_pg_foreign_data_wrapper fdwForm;
+	Relation	rel;
+	ObjTree    *ret;
+	ObjTree    *tmp;
+
+	rel = table_open(ForeignDataWrapperRelationId, RowExclusiveLock);
+
+	fdwTup = SearchSysCache1(FOREIGNDATAWRAPPEROID,
+							 ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(fdwTup))
+		elog(ERROR, "cache lookup failed for foreign-data wrapper with OID %u",
+			 objectId);
+
+	fdwForm = (Form_pg_foreign_data_wrapper) GETSTRUCT(fdwTup);
+
+	ret = new_objtree_VA("CREATE FOREIGN DATA WRAPPER %{identity}I", 1,
+						 "identity", ObjTypeString, NameStr(fdwForm->fdwname));
+
+	/* Add HANDLER clause */
+	if (!OidIsValid(fdwForm->fdwhandler))
+		tmp = new_objtree("NO HANDLER");
+	else
+	{
+		tmp = new_objtree_VA("HANDLER %{procedure}D", 1,
+							 "procedure", ObjTypeObject,
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 fdwForm->fdwhandler));
+	}
+	append_object_object(ret, "%{handler}s", tmp);
+
+	/* Add VALIDATOR clause */
+	if (!OidIsValid(fdwForm->fdwvalidator))
+		tmp = new_objtree("NO VALIDATOR");
+	else
+	{
+		tmp = new_objtree_VA("VALIDATOR %{procedure}D", 1,
+							 "procedure", ObjTypeObject,
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 fdwForm->fdwvalidator));
+	}
+	append_object_object(ret, "%{validator}s", tmp);
+
+	/* Add an OPTIONS clause, if any */
+	append_object_object(ret, "%{generic_options}s",
+						 deparse_FdwOptions(node->options, NULL, false));
+
+	ReleaseSysCache(fdwTup);
+	table_close(rel, RowExclusiveLock);
+
+	return ret;
+}
+
+/*
+ * Deparse an AlterFdwStmt (ALTER FOREIGN DATA WRAPPER)
+ *
+ * Given an FDW OID and the parse tree that created it, return an ObjTree
+ * representing the alter command.
+ *
+ * Verbose syntax
+ * ALTER FOREIGN DATA WRAPPER %{identity}I %{fdw_options: }s %{generic_options}D
+ */
+static ObjTree *
+deparse_AlterFdwStmt(Oid objectId, Node *parsetree)
+{
+	AlterFdwStmt *node = (AlterFdwStmt *) parsetree;
+	HeapTuple	fdwTup;
+	Form_pg_foreign_data_wrapper fdwForm;
+	Relation	rel;
+	ObjTree    *ret;
+	List	   *fdw_options = NIL;
+	ListCell   *cell;
+
+	rel = table_open(ForeignDataWrapperRelationId, RowExclusiveLock);
+
+	fdwTup = SearchSysCache1(FOREIGNDATAWRAPPEROID,
+							 ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(fdwTup))
+		elog(ERROR, "cache lookup failed for foreign-data wrapper with OID %u",
+			 objectId);
+
+	fdwForm = (Form_pg_foreign_data_wrapper) GETSTRUCT(fdwTup);
+
+	ret = new_objtree_VA("ALTER FOREIGN DATA WRAPPER %{identity}I", 1,
+						 "identity", ObjTypeString, NameStr(fdwForm->fdwname));
+
+	/*
+	 * Iterate through options, to see what changed, but use catalog as a
+	 * basis for new values.
+	 */
+	foreach(cell, node->func_options)
+	{
+		DefElem    *elem;
+		ObjTree    *tmp;
+
+		elem = lfirst(cell);
+
+		if (pg_strcasecmp(elem->defname, "handler") == 0)
+		{
+			/* add HANDLER clause */
+			if (!OidIsValid(fdwForm->fdwhandler))
+				tmp = new_objtree("NO HANDLER");
+			else
+			{
+				tmp = new_objtree_VA("HANDLER %{procedure}D", 1,
+									 "procedure", ObjTypeObject,
+									 new_objtree_for_qualname_id(ProcedureRelationId,
+																 fdwForm->fdwhandler));
+			}
+			fdw_options = lappend(fdw_options, new_object_object(tmp));
+		}
+		else if (pg_strcasecmp(elem->defname, "validator") == 0)
+		{
+			/* add VALIDATOR clause */
+			if (!OidIsValid(fdwForm->fdwvalidator))
+				tmp = new_objtree("NO VALIDATOR");
+			else
+			{
+				tmp = new_objtree_VA("VALIDATOR %{procedure}D", 1,
+									 "procedure", ObjTypeObject,
+									 new_objtree_for_qualname_id(ProcedureRelationId,
+																 fdwForm->fdwvalidator));
+			}
+			fdw_options = lappend(fdw_options, new_object_object(tmp));
+		}
+	}
+
+	/* Add HANDLER/VALIDATOR if specified */
+	append_array_object(ret, "%{fdw_options: }s", fdw_options);
+
+	/* Add an OPTIONS clause, if any */
+	append_object_object(ret, "%{generic_options}D",
+						 deparse_FdwOptions(node->options, NULL, false));
+
+	ReleaseSysCache(fdwTup);
+	table_close(rel, RowExclusiveLock);
+
+	return ret;
+}
+
+/*
+ * Deparse a CREATE TYPE AS RANGE statement
+ *
+ * Given a Range type OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE TYPE %{identity}D AS RANGE (%{definition:, }s)
+ */
+static ObjTree *
+deparse_CreateRangeStmt(Oid objectId, Node *parsetree)
+{
+	ObjTree    *tmp;
+	List	   *definition = NIL;
+	Relation	pg_range;
+	HeapTuple	rangeTup;
+	Form_pg_range rangeForm;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+
+	pg_range = table_open(RangeRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_range_rngtypid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(objectId));
+
+	scan = systable_beginscan(pg_range, RangeTypidIndexId, true,
+							  NULL, 1, key);
+
+	rangeTup = systable_getnext(scan);
+	if (!HeapTupleIsValid(rangeTup))
+		elog(ERROR, "cache lookup failed for range with type OID %u",
+			 objectId);
+
+	rangeForm = (Form_pg_range) GETSTRUCT(rangeTup);
+
+	/* SUBTYPE */
+	tmp = new_objtree_VA("SUBTYPE = %{type}D", 2,
+						 "clause", ObjTypeString, "subtype",
+						 "type", ObjTypeObject,
+						 new_objtree_for_qualname_id(TypeRelationId, rangeForm->rngsubtype));
+	definition = lappend(definition, new_object_object(tmp));
+
+	/* SUBTYPE_OPCLASS */
+	if (OidIsValid(rangeForm->rngsubopc))
+	{
+		tmp = new_objtree_VA("SUBTYPE_OPCLASS = %{opclass}D", 2,
+							 "clause", ObjTypeString, "opclass",
+							 "opclass", ObjTypeObject,
+							 new_objtree_for_qualname_id(OperatorClassRelationId,
+														 rangeForm->rngsubopc));
+		definition = lappend(definition, new_object_object(tmp));
+	}
+
+	/* COLLATION */
+	if (OidIsValid(rangeForm->rngcollation))
+	{
+		tmp = new_objtree_VA("COLLATION = %{collation}D", 2,
+							 "clause", ObjTypeString, "collation",
+							 "collation", ObjTypeObject,
+							 new_objtree_for_qualname_id(CollationRelationId,
+														 rangeForm->rngcollation));
+		definition = lappend(definition, new_object_object(tmp));
+	}
+
+	/* CANONICAL */
+	if (OidIsValid(rangeForm->rngcanonical))
+	{
+		tmp = new_objtree_VA("CANONICAL = %{canonical}D", 2,
+							 "clause", ObjTypeString, "canonical",
+							 "canonical", ObjTypeObject,
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 rangeForm->rngcanonical));
+		definition = lappend(definition, new_object_object(tmp));
+	}
+
+	/* SUBTYPE_DIFF */
+	if (OidIsValid(rangeForm->rngsubdiff))
+	{
+		tmp = new_objtree_VA("SUBTYPE_DIFF = %{subtype_diff}D", 2,
+							 "clause", ObjTypeString, "subtype_diff",
+							 "subtype_diff", ObjTypeObject,
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 rangeForm->rngsubdiff));
+		definition = lappend(definition, new_object_object(tmp));
+	}
+
+	systable_endscan(scan);
+	table_close(pg_range, RowExclusiveLock);
+
+	return new_objtree_VA("CREATE TYPE %{identity}D AS RANGE (%{definition:, }s)", 2,
+						  "identity", ObjTypeObject,
+						  new_objtree_for_qualname_id(TypeRelationId, objectId),
+						  "definition", ObjTypeArray, definition);
+}
+
+/*
+ * Deparse an AlterEnumStmt.
+ *
+ * Given an enum OID and a parse tree that modified it, return an ObjTree
+ * representing the alter type.
+ *
+ * Verbose syntax
+ * ALTER TYPE %{identity}D ADD VALUE %{if_not_exists}s %{value}L
+ * %{after_or_before}s %{neighbor}L
+ * 	OR
+ * ALTER TYPE %{identity}D RENAME VALUE %{value}L TO %{newvalue}L
+ */
+static ObjTree *
+deparse_AlterEnumStmt(Oid objectId, Node *parsetree)
+{
+	AlterEnumStmt *node = (AlterEnumStmt *) parsetree;
+	ObjTree    *ret;
+
+	ret = new_objtree_VA("ALTER TYPE %{identity}D", 1,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname_id(TypeRelationId,
+													 objectId));
+
+	if (!node->oldVal)
+	{
+		append_format_string(ret, "ADD VALUE");
+		append_string_object(ret, "%{if_not_exists}s", "if_not_exists",
+							 node->skipIfNewValExists ? "IF NOT EXISTS" : "");
+
+		append_string_object(ret, "%{value}L", "value", node->newVal);
+
+		if (node->newValNeighbor)
+		{
+			append_string_object(ret, "%{after_or_before}s",
+								 "after_or_before",
+								 node->newValIsAfter ? "AFTER" : "BEFORE");
+			append_string_object(ret, "%{neighbor}L", "neighbor",
+								 node->newValNeighbor);
+		}
+	}
+	else
+	{
+		append_string_object(ret, "RENAME VALUE %{value}L TO", "value",
+							 node->oldVal);
+		append_string_object(ret, "%{newvalue}L", "newvalue", node->newVal);
+	}
+
+	return ret;
+}
+
+/*
+ * Deparse an AlterExtensionStmt (ALTER EXTENSION .. UPDATE TO VERSION)
+ *
+ * Given an extension OID and a parse tree that modified it, return an ObjTree
+ * representing the alter type.
+ *
+ * Verbose syntax
+ * ALTER EXTENSION %{identity}I UPDATE %{options: }s
+ */
+static ObjTree *
+deparse_AlterExtensionStmt(Oid objectId, Node *parsetree)
+{
+	AlterExtensionStmt *node = (AlterExtensionStmt *) parsetree;
+	Relation	pg_extension;
+	HeapTuple	extTup;
+	Form_pg_extension extForm;
+	ObjTree    *ret;
+	List	   *list = NIL;
+	ListCell   *cell;
+	DefElem    *d_new_version = NULL;
+
+	pg_extension = table_open(ExtensionRelationId, AccessShareLock);
+	extTup = get_catalog_object_by_oid(pg_extension, Anum_pg_extension_oid, objectId);
+	if (!HeapTupleIsValid(extTup))
+		elog(ERROR, "cache lookup failed for extension with OID %u",
+			 objectId);
+	extForm = (Form_pg_extension) GETSTRUCT(extTup);
+
+	foreach(cell, node->options)
+	{
+		DefElem    *opt = (DefElem *) lfirst(cell);
+
+		if (strcmp(opt->defname, "new_version") == 0)
+		{
+			ObjTree    *tmp;
+
+			if (d_new_version)
+				elog(ERROR, "conflicting or redundant options for extension with OID %u",
+					 objectId);
+
+			d_new_version = opt;
+
+			tmp = new_objtree_VA("TO %{version}L", 2,
+								 "type", ObjTypeString, "version",
+								 "version", ObjTypeString, defGetString(opt));
+			list = lappend(list, new_object_object(tmp));
+		}
+		else
+			elog(ERROR, "unsupported option %s", opt->defname);
+	}
+
+	ret = new_objtree_VA("ALTER EXTENSION %{identity}I UPDATE %{options: }s", 2,
+						 "identity", ObjTypeString, NameStr(extForm->extname),
+						 "options", ObjTypeArray, list);
+
+	table_close(pg_extension, AccessShareLock);
+
+	return ret;
+}
+
+/*
+ * Deparse an AlterExtensionContentsStmt (ALTER EXTENSION ext ADD/DROP object)
+ *
+ * Verbose syntax
+ * ALTER EXTENSION %{extidentity}I ADD/DROP %{objidentity}s
+ */
+static ObjTree *
+deparse_AlterExtensionContentsStmt(Oid objectId, Node *parsetree,
+								   ObjectAddress objectAddress)
+{
+	AlterExtensionContentsStmt *node = (AlterExtensionContentsStmt *) parsetree;
+
+	Assert(node->action == +1 || node->action == -1);
+
+	return new_objtree_VA("ALTER EXTENSION %{extidentity}I %{extoption}s %{extobjtype}s %{objidentity}s", 4,
+						  "extidentity", ObjTypeString, node->extname,
+						  "extoption", ObjTypeString,
+						  node->action == +1 ? "ADD" : "DROP",
+						  "extobjtype", ObjTypeString,
+						  stringify_objtype(node->objtype, false),
+						  "objidentity", ObjTypeString,
+						  getObjectIdentity(&objectAddress, false));
+}
+
+/*
+ * Deparse an CreateCastStmt.
+ *
+ * Given a sequence OID and a parse tree that modified it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE CAST (%{sourcetype}T AS %{targettype}T) %{mechanism}s %{context}s
+ */
+static ObjTree *
+deparse_CreateCastStmt(Oid objectId, Node *parsetree)
+{
+	CreateCastStmt *node = (CreateCastStmt *) parsetree;
+	Relation	castrel;
+	HeapTuple	castTup;
+	Form_pg_cast castForm;
+	ObjTree    *ret;
+	char	   *context;
+
+	castrel = table_open(CastRelationId, AccessShareLock);
+	castTup = get_catalog_object_by_oid(castrel, Anum_pg_cast_oid, objectId);
+	if (!HeapTupleIsValid(castTup))
+		elog(ERROR, "cache lookup failed for cast with OID %u", objectId);
+	castForm = (Form_pg_cast) GETSTRUCT(castTup);
+
+	ret = new_objtree_VA("CREATE CAST (%{sourcetype}T AS %{targettype}T)", 2,
+						 "sourcetype", ObjTypeObject,
+						 new_objtree_for_type(castForm->castsource, -1),
+						 "targettype", ObjTypeObject,
+						 new_objtree_for_type(castForm->casttarget, -1));
+
+	if (node->inout)
+		append_string_object(ret, "%{mechanism}s", "mechanism",
+							 "WITH INOUT");
+	else if (node->func == NULL)
+		append_string_object(ret, "%{mechanism}s", "mechanism",
+							 "WITHOUT FUNCTION");
+	else
+	{
+		ObjTree    *tmp_obj;
+		StringInfoData func;
+		HeapTuple	funcTup;
+		Form_pg_proc funcForm;
+		int			i;
+
+		funcTup = SearchSysCache1(PROCOID, castForm->castfunc);
+		funcForm = (Form_pg_proc) GETSTRUCT(funcTup);
+
+		initStringInfo(&func);
+		appendStringInfo(&func, "%s(",
+						 quote_qualified_identifier(get_namespace_name(funcForm->pronamespace),
+													NameStr(funcForm->proname)));
+		for (i = 0; i < funcForm->pronargs; i++)
+		{
+			if (i != 0)
+				appendStringInfoChar(&func, ',');
+
+			appendStringInfoString(&func,
+								   format_type_be_qualified(funcForm->proargtypes.values[i]));
+		}
+		appendStringInfoChar(&func, ')');
+
+		tmp_obj = new_objtree_VA("WITH FUNCTION %{castfunction}s", 1,
+								"castfunction", ObjTypeString, func.data);
+		append_object_object(ret, "%{mechanism}s", tmp_obj);
+
+		ReleaseSysCache(funcTup);
+	}
+
+	switch (node->context)
+	{
+		case COERCION_IMPLICIT:
+			context = "AS IMPLICIT";
+			break;
+		case COERCION_ASSIGNMENT:
+			context = "AS ASSIGNMENT";
+			break;
+		case COERCION_EXPLICIT:
+			context = "";
+			break;
+		default:
+			elog(ERROR, "invalid coercion code %c", node->context);
+			return NULL;		/* keep compiler quiet */
+	}
+	append_string_object(ret, "%{context}s", "context", context);
+
+	table_close(castrel, AccessShareLock);
+
+	return ret;
+}
+
+/*
+ * Deparse an ALTER DEFAULT PRIVILEGES statement.
+ *
+ * Verbose syntax
+ * ALTER DEFAULT PRIVILEGES %{in_schema}s %{for_roles}s %{grant}s
+ */
+static ObjTree *
+deparse_AlterDefaultPrivilegesStmt(CollectedCommand *cmd)
+{
+	ObjTree    *ret;
+	AlterDefaultPrivilegesStmt *stmt = (AlterDefaultPrivilegesStmt *) cmd->parsetree;
+	List	   *roles = NIL;
+	List	   *schemas = NIL;
+	List	   *grantees;
+	List	   *privs;
+	ListCell   *cell;
+	ObjTree    *tmp;
+	ObjTree    *grant;
+	char	   *objtype;
+
+	ret = new_objtree("ALTER DEFAULT PRIVILEGES");
+
+	/* Scan the parse node to dig out the FOR ROLE and IN SCHEMA clauses */
+	foreach(cell, stmt->options)
+	{
+		DefElem    *opt = (DefElem *) lfirst(cell);
+		ListCell   *cell2;
+
+		Assert(IsA(opt, DefElem));
+		Assert(IsA(opt->arg, List));
+		if (strcmp(opt->defname, "roles") == 0)
+		{
+			foreach(cell2, (List *) opt->arg)
+			{
+				RoleSpec   *rolespec = lfirst(cell2);
+				ObjTree    *obj = new_objtree_for_rolespec(rolespec);
+
+				roles = lappend(roles, new_object_object(obj));
+			}
+		}
+		else if (strcmp(opt->defname, "schemas") == 0)
+		{
+			foreach(cell2, (List *) opt->arg)
+			{
+				String	   *val = lfirst_node(String, cell2);
+
+				schemas = lappend(schemas, new_string_object(strVal(val)));
+			}
+		}
+	}
+
+	/* Add the IN SCHEMA clause, if any */
+	tmp = new_objtree("IN SCHEMA");
+	append_array_object(tmp, "%{schemas:, }I", schemas);
+	if (schemas == NIL)
+		append_not_present(tmp);
+	append_object_object(ret, "%{in_schema}s", tmp);
+
+	/* Add the FOR ROLE clause, if any */
+	tmp = new_objtree("FOR ROLE");
+	append_array_object(tmp, "%{roles:, }R", roles);
+	if (roles == NIL)
+		append_not_present(tmp);
+	append_object_object(ret, "%{for_roles}s", tmp);
+
+	/*
+	 * Add the GRANT subcommand
+	 * Verbose syntax
+	 * GRANT %{privileges:, }s ON %{target}s TO %{grantees:, }R %{grant_option}s
+	 * or
+	 * REVOKE %{grant_option}s %{privileges:, }s ON %{target}s FROM %{grantees:, }R
+	 */
+	if (stmt->action->is_grant)
+		grant = new_objtree("GRANT");
+	else
+	{
+		grant = new_objtree("REVOKE");
+
+		/* Add the GRANT OPTION clause for REVOKE subcommand */
+		tmp = new_objtree_VA("GRANT OPTION FOR", 1,
+							 "present", ObjTypeBool,
+							 stmt->action->grant_option);
+		append_object_object(grant, "%{grant_option}s", tmp);
+	}
+
+	/*
+	 * Add the privileges list.  This uses the parser struct, as opposed to
+	 * the InternalGrant format used by GRANT.  There are enough other
+	 * differences that this doesn't seem worth improving.
+	 */
+	if (stmt->action->privileges == NIL)
+		privs = list_make1(new_string_object("ALL PRIVILEGES"));
+	else
+	{
+		privs = NIL;
+
+		foreach(cell, stmt->action->privileges)
+		{
+			AccessPriv *priv = lfirst(cell);
+
+			Assert(priv->cols == NIL);
+			privs = lappend(privs, new_string_object(priv->priv_name));
+		}
+	}
+
+	append_array_object(grant, "%{privileges:, }s", privs);
+
+	switch (cmd->d.defprivs.objtype)
+	{
+		case OBJECT_TABLE:
+			objtype = "TABLES";
+			break;
+		case OBJECT_FUNCTION:
+			objtype = "FUNCTIONS";
+			break;
+		case OBJECT_ROUTINE:
+			objtype = "ROUTINES";
+			break;
+		case OBJECT_SEQUENCE:
+			objtype = "SEQUENCES";
+			break;
+		case OBJECT_TYPE:
+			objtype = "TYPES";
+			break;
+		case OBJECT_SCHEMA:
+			objtype = "SCHEMAS";
+			break;
+		default:
+			elog(ERROR, "invalid OBJECT value %d for default privileges", cmd->d.defprivs.objtype);
+	}
+
+	/* Add the target object type */
+	append_string_object(grant, "ON %{target}s", "target", objtype);
+
+	/* Add the grantee list */
+	grantees = NIL;
+	foreach(cell, stmt->action->grantees)
+	{
+		RoleSpec   *spec = (RoleSpec *) lfirst(cell);
+		ObjTree    *obj = new_objtree_for_rolespec(spec);
+
+		grantees = lappend(grantees, new_object_object(obj));
+	}
+
+	if (stmt->action->is_grant)
+	{
+		append_array_object(grant, "TO %{grantees:, }R", grantees);
+
+		/* Add the WITH GRANT OPTION clause for GRANT subcommand */
+		tmp = new_objtree_VA("WITH GRANT OPTION", 1,
+							 "present", ObjTypeBool,
+							 stmt->action->grant_option);
+		append_object_object(grant, "%{grant_option}s", tmp);
+	}
+	else
+		append_array_object(grant, "FROM %{grantees:, }R", grantees);
+
+	append_object_object(ret, "%{grant}s", grant);
+
+	return ret;
+}
+
+/*
+ * Deparse the CREATE DOMAIN
+ *
+ * Given a function OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE DOMAIN %{identity}D AS %{type}T %{not_null}s %{constraints}s
+ * %{collation}s
+ */
+static ObjTree *
+deparse_CreateDomain(Oid objectId, Node *parsetree)
+{
+	ObjTree    *ret;
+	ObjTree    *tmp_obj;
+	HeapTuple	typTup;
+	Form_pg_type typForm;
+	List	   *constraints;
+	char	   *defval;
+
+	typTup = SearchSysCache1(TYPEOID, objectId);
+	if (!HeapTupleIsValid(typTup))
+		elog(ERROR, "cache lookup failed for domain with OID %u", objectId);
+	typForm = (Form_pg_type) GETSTRUCT(typTup);
+
+	ret = new_objtree_VA("CREATE DOMAIN %{identity}D AS %{type}T %{not_null}s", 3,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname_id(TypeRelationId, objectId),
+						 "type", ObjTypeObject,
+						 new_objtree_for_type(typForm->typbasetype,
+											  typForm->typtypmod),
+						 "not_null", ObjTypeString,
+						 typForm->typnotnull ? "NOT NULL" : "");
+
+	constraints = obtainConstraints(NIL, InvalidOid, objectId);
+	if (constraints == NIL)
+	{
+		tmp_obj = new_objtree("");
+		append_not_present(tmp_obj);
+	}
+	else
+		tmp_obj = new_objtree_VA("%{elements:, }s", 1,
+								"elements", ObjTypeArray, constraints);
+	append_object_object(ret, "%{constraints}s", tmp_obj);
+
+	tmp_obj = new_objtree("COLLATE");
+	if (OidIsValid(typForm->typcollation))
+	{
+		ObjTree    *collname;
+
+		collname = new_objtree_for_qualname_id(CollationRelationId,
+											   typForm->typcollation);
+		append_object_object(tmp_obj, "%{name}D", collname);
+	}
+	else
+		append_not_present(tmp_obj);
+	append_object_object(ret, "%{collation}s", tmp_obj);
+
+	defval = DomainGetDefault(typTup, true);
+	if (defval)
+		append_string_object(ret, "DEFAULT %{default}s", "default", defval);
+
+	ReleaseSysCache(typTup);
+
+	return ret;
+}
+
+/*
+ * Deparse a CreateFunctionStmt (CREATE FUNCTION)
+ *
+ * Given a function OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ *
+ * CREATE %{or_replace}s FUNCTION %{signature}s RETURNS %{return_type}s
+ * LANGUAGE %{transform_type}s %{language}I %{window}s %{volatility}s
+ * %{parallel_safety}s %{leakproof}s %{strict}s %{security_definer}s
+ * %{cost}s %{rows}s %{support}s %{set_options: }s AS %{objfile}L,
+ * %{symbol}L
+ */
+static ObjTree *
+deparse_CreateFunction(Oid objectId, Node *parsetree)
+{
+	CreateFunctionStmt *node = (CreateFunctionStmt *) parsetree;
+	ObjTree    *ret;
+	ObjTree    *tmp_obj;
+	Datum		tmpdatum;
+	char	   *source;
+	char	   *probin = NULL;
+	List	   *params;
+	List	   *defaults;
+	List	   *sets = NIL;
+	List	   *types = NIL;
+	ListCell   *cell;
+	ListCell   *curdef;
+	ListCell   *table_params = NULL;
+	HeapTuple	procTup;
+	Form_pg_proc procForm;
+	HeapTuple	langTup;
+	Oid		   *typarray;
+	Oid		   *trftypes;
+	Form_pg_language langForm;
+	int			i;
+	int			typnum;
+	int			ntypes;
+	int			paramcount = list_length(node->parameters);
+	bool		isnull;
+	bool		isfunction;
+
+	/* Get the pg_proc tuple */
+	procTup = SearchSysCache1(PROCOID, objectId);
+	if (!HeapTupleIsValid(procTup))
+		elog(ERROR, "cache lookup failed for function with OID %u",
+			 objectId);
+	procForm = (Form_pg_proc) GETSTRUCT(procTup);
+
+	/* Get the corresponding pg_language tuple */
+	langTup = SearchSysCache1(LANGOID, procForm->prolang);
+	if (!HeapTupleIsValid(langTup))
+		elog(ERROR, "cache lookup failed for language with OID %u",
+			 procForm->prolang);
+	langForm = (Form_pg_language) GETSTRUCT(langTup);
+
+	/*
+	 * Determine useful values for prosrc and probin.  We cope with probin
+	 * being either NULL or "-", but prosrc must have a valid value.
+	 */
+	tmpdatum = SysCacheGetAttr(PROCOID, procTup,
+							   Anum_pg_proc_prosrc, &isnull);
+	if (isnull)
+		elog(ERROR, "null prosrc in function with OID %u", objectId);
+	source = TextDatumGetCString(tmpdatum);
+
+	/* Determine a useful value for probin */
+	tmpdatum = SysCacheGetAttr(PROCOID, procTup,
+							   Anum_pg_proc_probin, &isnull);
+	if (!isnull)
+	{
+		probin = TextDatumGetCString(tmpdatum);
+		if (probin[0] == '\0' || strcmp(probin, "-") == 0)
+			probin = NULL;
+	}
+
+	ret = new_objtree_VA("CREATE %{or_replace}s", 1,
+						 "or_replace", ObjTypeString,
+						 node->replace ? "OR REPLACE" : "");
+
+	/*
+	 * To construct the arguments array, extract the type OIDs from the
+	 * function's pg_proc entry.  If pronargs equals the parameter list
+	 * length, there are no OUT parameters and thus we can extract the type
+	 * OID from proargtypes; otherwise we need to decode proallargtypes, which
+	 * is a bit more involved.
+	 */
+	typarray = palloc(paramcount * sizeof(Oid));
+	if (paramcount > procForm->pronargs)
+	{
+		Datum		alltypes;
+		Datum	   *values;
+		bool	   *nulls;
+		int			nelems;
+
+		alltypes = SysCacheGetAttr(PROCOID, procTup,
+								   Anum_pg_proc_proallargtypes, &isnull);
+		if (isnull)
+			elog(ERROR, "null proallargtypes, more number of parameters than args in function with OID %u",
+				 objectId);
+		deconstruct_array(DatumGetArrayTypeP(alltypes),
+						  OIDOID, 4, 't', 'i',
+						  &values, &nulls, &nelems);
+		if (nelems != paramcount)
+			elog(ERROR, "mismatched proallargatypes");
+		for (i = 0; i < paramcount; i++)
+			typarray[i] = values[i];
+	}
+	else
+	{
+		for (i = 0; i < paramcount; i++)
+			typarray[i] = procForm->proargtypes.values[i];
+	}
+
+	/*
+	 * If there are any default expressions, we read the deparsed expression
+	 * as a list so that we can attach them to each argument.
+	 */
+	tmpdatum = SysCacheGetAttr(PROCOID, procTup,
+							   Anum_pg_proc_proargdefaults, &isnull);
+	if (!isnull)
+	{
+		defaults = FunctionGetDefaults(DatumGetTextP(tmpdatum));
+		curdef = list_head(defaults);
+	}
+	else
+	{
+		defaults = NIL;
+		curdef = NULL;
+	}
+
+	/*
+	 * Now iterate over each parameter in the parse tree to create the
+	 * parameters array.
+	 */
+	params = NIL;
+	typnum = 0;
+	foreach(cell, node->parameters)
+	{
+		FunctionParameter *param = (FunctionParameter *) lfirst(cell);
+		ObjTree    *param_obj;
+		ObjTree    *defaultval;
+		ObjTree    *name;
+
+		/*
+		 * A PARAM_TABLE parameter indicates the end of input arguments; the
+		 * following parameters are part of the return type.  We ignore them
+		 * here, but keep track of the current position in the list so that we
+		 * can easily produce the return type below.
+		 */
+		if (param->mode == FUNC_PARAM_TABLE)
+		{
+			table_params = cell;
+			break;
+		}
+
+		/*
+		 * Verbose syntax for paramater: %{mode}s %{name}s %{type}T
+		 * %{default}s
+		 */
+		param_obj = new_objtree_VA("%{mode}s", 1,
+								  "mode", ObjTypeString,
+								  param->mode == FUNC_PARAM_OUT ? "OUT" :
+								  param->mode == FUNC_PARAM_INOUT ? "INOUT" :
+								  param->mode == FUNC_PARAM_VARIADIC ? "VARIADIC" :
+								  "IN");
+
+		/* Optional wholesale suppression of "name" occurs here */
+		name = new_objtree("");
+		if (param->name)
+			append_string_object(name, "%{name}I", "name", param->name);
+		else
+		{
+			append_null_object(name, "%{name}I");
+			append_not_present(name);
+		}
+
+		append_object_object(param_obj, "%{name}s", name);
+
+		defaultval = new_objtree("DEFAULT");
+		if (PointerIsValid(param->defexpr))
+		{
+			char	   *expr;
+
+			if (curdef == NULL)
+				elog(ERROR, "proargdefaults list too short");
+			expr = lfirst(curdef);
+
+			append_string_object(defaultval, "%{value}s", "value", expr);
+			curdef = lnext(defaults, curdef);
+		}
+		else
+			append_not_present(defaultval);
+
+		append_object_object(param_obj, "%{type}T",
+							 new_objtree_for_type(typarray[typnum++], -1));
+
+		append_object_object(param_obj, "%{default}s", defaultval);
+
+		params = lappend(params, new_object_object(param_obj));
+	}
+
+	tmp_obj = new_objtree_VA("%{identity}D", 1,
+							"identity", ObjTypeObject,
+							new_objtree_for_qualname_id(ProcedureRelationId,
+														objectId));
+
+	append_format_string(tmp_obj, "(");
+	append_array_object(tmp_obj, "%{arguments:, }s", params);
+	append_format_string(tmp_obj, ")");
+
+	isfunction = (procForm->prokind != PROKIND_PROCEDURE);
+
+	if (isfunction)
+		append_object_object(ret, "FUNCTION %{signature}s", tmp_obj);
+	else
+		append_object_object(ret, "PROCEDURE %{signature}s", tmp_obj);
+
+	/*
+	 * A return type can adopt one of two forms: either a [SETOF] some_type,
+	 * or a TABLE(list-of-types).  We can tell the second form because we saw
+	 * a table param above while scanning the argument list.
+	 */
+	if (table_params == NULL)
+	{
+		tmp_obj = new_objtree_VA("", 1,
+								"return_form", ObjTypeString, "plain");
+		append_string_object(tmp_obj, "%{setof}s", "setof",
+							 procForm->proretset ? "SETOF" : "");
+		append_object_object(tmp_obj, "%{rettype}T",
+							 new_objtree_for_type(procForm->prorettype, -1));
+	}
+	else
+	{
+		List	   *rettypes = NIL;
+		ObjTree    *param_obj;
+
+		tmp_obj = new_objtree_VA("TABLE", 1,
+								"return_form", ObjTypeString, "table");
+		for (; table_params != NULL; table_params = lnext(node->parameters, table_params))
+		{
+			FunctionParameter *param = lfirst(table_params);
+
+			param_obj = new_objtree_VA("%{name}I %{type}T", 2,
+									  "name", ObjTypeString, param->name,
+									  "type", ObjTypeObject,
+									  new_objtree_for_type(typarray[typnum++], -1));
+			rettypes = lappend(rettypes, new_object_object(param_obj));
+		}
+
+		append_array_object(tmp_obj, "(%{rettypes:, }s)", rettypes);
+	}
+
+	if (isfunction)
+		append_object_object(ret, "RETURNS %{return_type}s", tmp_obj);
+
+	/* TRANSFORM FOR TYPE */
+	tmp_obj = new_objtree("TRANSFORM");
+
+	ntypes = get_func_trftypes(procTup, &trftypes);
+	for (i = 0; i < ntypes; i++)
+	{
+		tmp_obj = new_objtree_VA("FOR TYPE %{type}T", 1,
+								"type", ObjTypeObject,
+								new_objtree_for_type(trftypes[i], -1));
+		types = lappend(types, tmp_obj);
+	}
+
+	if (types)
+		append_array_object(tmp_obj, "%{for_type:, }s", types);
+	else
+		append_not_present(tmp_obj);
+
+	append_object_object(ret, "%{transform_type}s", tmp_obj);
+
+	append_string_object(ret, "LANGUAGE %{language}I", "language",
+						 NameStr(langForm->lanname));
+
+	if (isfunction)
+	{
+		append_string_object(ret, "%{window}s", "window",
+							 procForm->prokind == PROKIND_WINDOW ? "WINDOW" : "");
+		append_string_object(ret, "%{volatility}s", "volatility",
+							 procForm->provolatile == PROVOLATILE_VOLATILE ?
+							 "VOLATILE" :
+							 procForm->provolatile == PROVOLATILE_STABLE ?
+							 "STABLE" : "IMMUTABLE");
+
+		append_string_object(ret, "%{parallel_safety}s",
+							 "parallel_safety",
+							 procForm->proparallel == PROPARALLEL_SAFE ?
+							 "PARALLEL SAFE" :
+							 procForm->proparallel == PROPARALLEL_RESTRICTED ?
+							 "PARALLEL RESTRICTED" : "PARALLEL UNSAFE");
+
+		append_string_object(ret, "%{leakproof}s", "leakproof",
+							 procForm->proleakproof ? "LEAKPROOF" : "");
+		append_string_object(ret, "%{strict}s", "strict",
+							 procForm->proisstrict ?
+							 "RETURNS NULL ON NULL INPUT" :
+							 "CALLED ON NULL INPUT");
+
+		append_string_object(ret, "%{security_definer}s",
+							 "security_definer",
+							 procForm->prosecdef ?
+							 "SECURITY DEFINER" : "SECURITY INVOKER");
+
+		append_object_object(ret, "%{cost}s",
+							 new_objtree_VA("COST %{cost}n", 1,
+											"cost", ObjTypeFloat,
+											procForm->procost));
+
+		tmp_obj = new_objtree("ROWS");
+		if (procForm->prorows == 0)
+			append_not_present(tmp_obj);
+		else
+			append_float_object(tmp_obj, "%{rows}n", procForm->prorows);
+		append_object_object(ret, "%{rows}s", tmp_obj);
+
+		tmp_obj = new_objtree("SUPPORT %{name}s");
+		if (procForm->prosupport)
+		{
+			Oid			argtypes[] = { INTERNALOID };
+
+			/*
+			 * We should qualify the support function's name if it wouldn't be
+			 * resolved by lookup in the current search path.
+			 */
+			append_string_object(tmp_obj, "%{name}s", "name",
+								 generate_function_name(procForm->prosupport, 1,
+														NIL, argtypes,
+														false, NULL,
+														EXPR_KIND_NONE));
+		}
+		else
+			append_not_present(tmp_obj);
+
+		append_object_object(ret, "%{support}s", tmp_obj);
+	}
+
+	foreach(cell, node->options)
+	{
+		DefElem    *defel = (DefElem *) lfirst(cell);
+
+		if (strcmp(defel->defname, "set") == 0)
+		{
+			VariableSetStmt *sstmt = (VariableSetStmt *) defel->arg;
+			char	   *value = ExtractSetVariableArgs(sstmt);
+
+			tmp_obj = deparse_FunctionSet(sstmt->kind, sstmt->name, value);
+			sets = lappend(sets, new_object_object(tmp_obj));
+		}
+	}
+	append_array_object(ret, "%{set_options: }s", sets);
+
+	/* Add the function definition */
+	(void) SysCacheGetAttr(PROCOID, procTup, Anum_pg_proc_prosqlbody, &isnull);
+	if (procForm->prolang == SQLlanguageId && !isnull)
+	{
+		StringInfoData buf;
+
+		initStringInfo(&buf);
+		print_function_sqlbody(&buf, procTup);
+
+		append_string_object(ret, "%{definition}s", "definition",
+							 buf.data);
+	}
+	else if (probin == NULL)
+		append_string_object(ret, "AS %{definition}L", "definition", source);
+	else
+	{
+		append_string_object(ret, "AS %{objfile}L", "objfile", probin);
+		append_string_object(ret, ", %{symbol}L", "symbol", source);
+	}
+
+	ReleaseSysCache(langTup);
+	ReleaseSysCache(procTup);
+
+	return ret;
+}
+
+/*
+ * Deparse a CREATE OPERATOR CLASS command.
+ *
+ * Verbose syntax
+ * CREATE OPERATOR CLASS %{identity}D %{default}s FOR TYPE %{type}T USING
+ * %{amname}I %{opfamily}s AS %{items:, }s
+ */
+static ObjTree *
+deparse_CreateOpClassStmt(CollectedCommand *cmd)
+{
+	Oid			opcoid = cmd->d.createopc.address.objectId;
+	HeapTuple	opcTup;
+	HeapTuple	opfTup;
+	Form_pg_opfamily opfForm;
+	Form_pg_opclass opcForm;
+	ObjTree    *ret;
+	ObjTree    *tmp_obj;
+	List	   *list;
+	ListCell   *cell;
+
+	/* Don't deparse SQL commands generated while creating extension */
+	if (cmd->in_extension)
+		return NULL;
+
+	opcTup = SearchSysCache1(CLAOID, ObjectIdGetDatum(opcoid));
+	if (!HeapTupleIsValid(opcTup))
+		elog(ERROR, "cache lookup failed for opclass with OID %u", opcoid);
+	opcForm = (Form_pg_opclass) GETSTRUCT(opcTup);
+
+	opfTup = SearchSysCache1(OPFAMILYOID, opcForm->opcfamily);
+	if (!HeapTupleIsValid(opfTup))
+		elog(ERROR, "cache lookup failed for operator family with OID %u", opcForm->opcfamily);
+	opfForm = (Form_pg_opfamily) GETSTRUCT(opfTup);
+
+	ret = new_objtree_VA("CREATE OPERATOR CLASS %{identity}D %{default}s FOR TYPE %{type}T USING %{amname}I", 4,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(opcForm->opcnamespace,
+												  NameStr(opcForm->opcname)),
+						 "default", ObjTypeString,
+						 opcForm->opcdefault ? "DEFAULT" : "",
+						 "type", ObjTypeObject,
+						 new_objtree_for_type(opcForm->opcintype, -1),
+						 "amname", ObjTypeString, get_am_name(opcForm->opcmethod));
+
+	/*
+	 * Add the FAMILY clause, but if it has the same name and namespace as the
+	 * opclass, then have it expand to empty because it would cause a failure
+	 * if the opfamily was created internally.
+	 */
+	tmp_obj = new_objtree_VA("FAMILY %{opfamily}D", 1,
+							"opfamily", ObjTypeObject,
+							new_objtree_for_qualname(opfForm->opfnamespace,
+													 NameStr(opfForm->opfname)));
+
+	if (strcmp(NameStr(opfForm->opfname), NameStr(opcForm->opcname)) == 0 &&
+		opfForm->opfnamespace == opcForm->opcnamespace)
+		append_not_present(tmp_obj);
+
+	append_object_object(ret, "%{opfamily}s", tmp_obj);
+
+	/*
+	 * Add the initial item list.  Note we always add the STORAGE clause, even
+	 * when it is implicit in the original command.
+	 */
+	tmp_obj = new_objtree("STORAGE");
+	append_object_object(tmp_obj, "%{type}T",
+						 new_objtree_for_type(OidIsValid(opcForm->opckeytype) ?
+											  opcForm->opckeytype : opcForm->opcintype,
+											  -1));
+	list = list_make1(new_object_object(tmp_obj));
+
+	/* Add the declared operators */
+	foreach(cell, cmd->d.createopc.operators)
+	{
+		OpFamilyMember *oper = lfirst(cell);
+
+		tmp_obj = new_objtree_VA("OPERATOR %{num}n %{operator}O(%{ltype}T, %{rtype}T)", 4,
+								"num", ObjTypeInteger, oper->number,
+								"operator", ObjTypeObject,
+								new_objtree_for_qualname_id(OperatorRelationId,
+															oper->object),
+								"ltype", ObjTypeObject,
+								new_objtree_for_type(oper->lefttype, -1),
+								"rtype", ObjTypeObject,
+								new_objtree_for_type(oper->righttype, -1));
+
+		/* Add the FOR SEARCH / FOR ORDER BY clause */
+		if (oper->sortfamily == InvalidOid)
+			append_string_object(tmp_obj, "%{purpose}s", "purpose",
+								 "FOR SEARCH");
+		else
+		{
+			ObjTree    *tmp_obj2;
+
+			tmp_obj2 = new_objtree("FOR ORDER BY %{opfamily}D");
+			append_object_object(tmp_obj2, "opfamily",
+								 new_objtree_for_qualname_id(OperatorFamilyRelationId,
+															 oper->sortfamily));
+			append_object_object(tmp_obj, "%{purpose}s", tmp_obj2);
+		}
+
+		list = lappend(list, new_object_object(tmp_obj));
+	}
+
+	/* Add the declared support functions */
+	foreach(cell, cmd->d.createopc.procedures)
+	{
+		OpFamilyMember *proc = lfirst(cell);
+		HeapTuple	procTup;
+		Form_pg_proc procForm;
+		Oid		   *proargtypes;
+		List	   *arglist = NIL;
+		int			i;
+
+		procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(proc->object));
+		if (!HeapTupleIsValid(procTup))
+			elog(ERROR, "cache lookup failed for procedure with OID %u",
+				 proc->object);
+		procForm = (Form_pg_proc) GETSTRUCT(procTup);
+
+		tmp_obj = new_objtree_VA("FUNCTION %{num}n (%{ltype}T, %{rtype}T) %{function}D", 4,
+								"num", ObjTypeInteger, proc->number,
+								"ltype", ObjTypeObject,
+								new_objtree_for_type(proc->lefttype, -1),
+								"rtype", ObjTypeObject,
+								new_objtree_for_type(proc->righttype, -1),
+								"function", ObjTypeObject,
+								new_objtree_for_qualname(procForm->pronamespace,
+														 NameStr(procForm->proname)));
+
+		proargtypes = procForm->proargtypes.values;
+		for (i = 0; i < procForm->pronargs; i++)
+		{
+			ObjTree    *arg;
+
+			arg = new_objtree_for_type(proargtypes[i], -1);
+			arglist = lappend(arglist, new_object_object(arg));
+		}
+
+		append_format_string(tmp_obj, "(");
+		append_array_object(tmp_obj, "%{argtypes:, }T", arglist);
+		append_format_string(tmp_obj, ")");
+
+		ReleaseSysCache(procTup);
+
+		list = lappend(list, new_object_object(tmp_obj));
+	}
+
+	append_array_object(ret, "AS %{items:, }s", list);
+
+	ReleaseSysCache(opfTup);
+	ReleaseSysCache(opcTup);
+
+	return ret;
+}
+
+/*
+ * Deparse a CreateOpFamilyStmt (CREATE OPERATOR FAMILY)
+ *
+ * Given a operator family OID and the parse tree that created it, return an
+ * ObjTree representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE OPERATOR FAMILY %{identity}D USING %{amname}I
+ */
+static ObjTree *
+deparse_CreateOpFamily(Oid objectId, Node *parsetree)
+{
+	HeapTuple	opfTup;
+	HeapTuple	amTup;
+	Form_pg_opfamily opfForm;
+	Form_pg_am	amForm;
+	ObjTree    *ret;
+
+	opfTup = SearchSysCache1(OPFAMILYOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(opfTup))
+		elog(ERROR, "cache lookup failed for operator family with OID %u", objectId);
+	opfForm = (Form_pg_opfamily) GETSTRUCT(opfTup);
+
+	amTup = SearchSysCache1(AMOID, ObjectIdGetDatum(opfForm->opfmethod));
+	if (!HeapTupleIsValid(amTup))
+		elog(ERROR, "cache lookup failed for access method with OID %u",
+			 opfForm->opfmethod);
+	amForm = (Form_pg_am) GETSTRUCT(amTup);
+
+	ret = new_objtree_VA("CREATE OPERATOR FAMILY %{identity}D USING %{amname}I", 2,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(opfForm->opfnamespace,
+												  NameStr(opfForm->opfname)),
+						 "amname", ObjTypeString, NameStr(amForm->amname));
+
+	ReleaseSysCache(amTup);
+	ReleaseSysCache(opfTup);
+
+	return ret;
+}
+
+/*
+ * Add common clauses to CreatePolicy or AlterPolicy deparse objects.
+ */
+static void
+add_policy_clauses(ObjTree *ret, Oid policyOid, List *roles, bool do_qual,
+				   bool do_with_check)
+{
+	Relation	polRel = table_open(PolicyRelationId, AccessShareLock);
+	HeapTuple	polTup = get_catalog_object_by_oid(polRel, Anum_pg_policy_oid, policyOid);
+	Form_pg_policy polForm;
+
+	if (!HeapTupleIsValid(polTup))
+		elog(ERROR, "cache lookup failed for policy with OID %u", policyOid);
+
+	polForm = (Form_pg_policy) GETSTRUCT(polTup);
+
+	/* Add the "ON table" clause */
+	append_object_object(ret, "ON %{table}D",
+						 new_objtree_for_qualname_id(RelationRelationId,
+													 polForm->polrelid));
+
+	/*
+	 * Add the "TO role" clause, if any.  In the CREATE case, it always
+	 * contains at least PUBLIC, but in the ALTER case it might be empty.
+	 */
+	if (roles)
+	{
+		List	   *list = NIL;
+		ListCell   *cell;
+
+		foreach(cell, roles)
+		{
+			RoleSpec   *spec = (RoleSpec *) lfirst(cell);
+
+			list = lappend(list,
+						   new_object_object(new_objtree_for_rolespec(spec)));
+		}
+		append_array_object(ret, "TO %{role:, }R", list);
+	}
+	else
+		append_not_present(ret);
+
+	/* Add the USING clause, if any */
+	if (do_qual)
+	{
+		Datum		deparsed;
+		Datum		storedexpr;
+		bool		isnull;
+
+		storedexpr = heap_getattr(polTup, Anum_pg_policy_polqual,
+								  RelationGetDescr(polRel), &isnull);
+		if (isnull)
+			elog(ERROR, "null polqual expression in policy %u", policyOid);
+		deparsed = DirectFunctionCall2(pg_get_expr, storedexpr, polForm->polrelid);
+		append_string_object(ret, "USING (%{expression}s)", "expression",
+							 TextDatumGetCString(deparsed));
+	}
+	else
+		append_not_present(ret);
+
+	/* Add the WITH CHECK clause, if any */
+	if (do_with_check)
+	{
+		Datum		deparsed;
+		Datum		storedexpr;
+		bool		isnull;
+
+		storedexpr = heap_getattr(polTup, Anum_pg_policy_polwithcheck,
+								  RelationGetDescr(polRel), &isnull);
+		if (isnull)
+			elog(ERROR, "null polwithcheck expression in policy %u", policyOid);
+		deparsed = DirectFunctionCall2(pg_get_expr, storedexpr, polForm->polrelid);
+		append_string_object(ret, "WITH CHECK (%{expression}s)",
+							 "expression", TextDatumGetCString(deparsed));
+	}
+	else
+		append_not_present(ret);
+
+	relation_close(polRel, AccessShareLock);
+}
+
+/*
+ * Deparse a CreatePolicyStmt (CREATE POLICY)
+ *
+ * Given a policy OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE POLICY %{identity}I
+ */
+static ObjTree *
+deparse_CreatePolicyStmt(Oid objectId, Node *parsetree)
+{
+	CreatePolicyStmt *node = (CreatePolicyStmt *) parsetree;
+	ObjTree    *ret;
+
+	ret = new_objtree_VA("CREATE POLICY %{identity}I", 1,
+						 "identity", ObjTypeString, node->policy_name);
+
+	/* Add the rest of the stuff */
+	add_policy_clauses(ret, objectId, node->roles, node->qual != NULL,
+					   node->with_check != NULL);
+
+	return ret;
+}
+
+/*
+ * Deparse a AlterPolicyStmt (ALTER POLICY)
+ *
+ * Given a policy OID and the parse tree of the ALTER POLICY command, return
+ * an ObjTree representing the alter command.
+ *
+ * Verbose syntax
+ * ALTER POLICY %{identity}I
+ */
+static ObjTree *
+deparse_AlterPolicyStmt(Oid objectId, Node *parsetree)
+{
+	AlterPolicyStmt *node = (AlterPolicyStmt *) parsetree;
+	ObjTree    *ret;
+
+	ret = new_objtree_VA("ALTER POLICY %{identity}I", 1,
+						 "identity", ObjTypeString, node->policy_name);
+
+	/* Add the rest of the stuff */
+	add_policy_clauses(ret, objectId, node->roles, node->qual != NULL,
+					   node->with_check != NULL);
+
+	return ret;
+}
+
+/*
+ * Deparse a CreateSchemaStmt.
+ *
+ * Given a schema OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE SCHEMA %{if_not_exists}s %{name}I %{authorization}s
+*/
+static ObjTree *
+deparse_CreateSchemaStmt(Oid objectId, Node *parsetree)
+{
+	CreateSchemaStmt *node = (CreateSchemaStmt *) parsetree;
+	ObjTree    *ret;
+	ObjTree    *auth;
+
+	ret = new_objtree_VA("CREATE SCHEMA %{if_not_exists}s %{name}I", 2,
+						 "if_not_exists", ObjTypeString,
+						 node->if_not_exists ? "IF NOT EXISTS" : "",
+						 "name", ObjTypeString,
+						 node->schemaname ? node->schemaname : "");
+
+	auth = new_objtree("AUTHORIZATION");
+	if (node->authrole)
+		append_string_object(auth, "%{authorization_role}I",
+							 "authorization_role",
+							 get_rolespec_name(node->authrole));
+	else
+	{
+		append_null_object(auth, "%{authorization_role}I");
+		append_not_present(auth);
+	}
+	append_object_object(ret, "%{authorization}s", auth);
+
+	return ret;
+}
+
+/*
+ * Return the default value of a domain.
+ */
+static char *
+DomainGetDefault(HeapTuple domTup, bool missing_ok)
+{
+	Datum		def;
+	Node	   *defval;
+	char	   *defstr;
+	bool		isnull;
+
+	def = SysCacheGetAttr(TYPEOID, domTup, Anum_pg_type_typdefaultbin,
+						  &isnull);
+	if (isnull)
+	{
+		if (!missing_ok)
+			elog(ERROR, "domain \"%s\" does not have a default value",
+				NameStr(((Form_pg_type) GETSTRUCT(domTup))->typname));
+		else
+			return NULL;
+	}
+
+	defval = stringToNode(TextDatumGetCString(def));
+	defstr = deparse_expression(defval, NULL /* dpcontext? */ ,
+								false, false);
+
+	return defstr;
+}
+
+/*
+ * Deparse a AlterDomainStmt.
+ *
+ * Verbose syntax
+ * ALTER DOMAIN %{identity}D DROP DEFAULT
+ * OR
+ * ALTER DOMAIN %{identity}D SET DEFAULT %{default}s
+ * OR
+ * ALTER DOMAIN %{identity}D DROP NOT NULL
+ * OR
+ * ALTER DOMAIN %{identity}D SET NOT NULL
+ * OR
+ * ALTER DOMAIN %{identity}D ADD CONSTRAINT %{constraint_name}s %{definition}s
+ * OR
+ * ALTER DOMAIN %{identity}D DROP CONSTRAINT IF EXISTS %{constraint_name}s %{cascade}s
+ * OR
+ * ALTER DOMAIN %{identity}D VALIDATE CONSTRAINT %{constraint_name}s
+ */
+static ObjTree *
+deparse_AlterDomainStmt(Oid objectId, Node *parsetree,
+						ObjectAddress constraintAddr)
+{
+	AlterDomainStmt *node = (AlterDomainStmt *) parsetree;
+	HeapTuple	domTup;
+	Form_pg_type domForm;
+	ObjTree    *ret;
+
+	domTup = SearchSysCache1(TYPEOID, objectId);
+	if (!HeapTupleIsValid(domTup))
+		elog(ERROR, "cache lookup failed for domain with OID %u", objectId);
+	domForm = (Form_pg_type) GETSTRUCT(domTup);
+
+	switch (node->subtype)
+	{
+		case 'T':
+			/* SET DEFAULT / DROP DEFAULT */
+			if (node->def == NULL)
+				ret = new_objtree_VA("ALTER DOMAIN %{identity}D DROP DEFAULT", 2,
+									 "type", ObjTypeString, "drop default",
+									 "identity", ObjTypeObject,
+									 new_objtree_for_qualname(domForm->typnamespace,
+															  NameStr(domForm->typname)));
+			else
+				ret = new_objtree_VA("ALTER DOMAIN %{identity}D SET DEFAULT %{default}s", 3,
+									 "type", ObjTypeString, "set default",
+									 "identity", ObjTypeObject,
+									 new_objtree_for_qualname(domForm->typnamespace,
+															  NameStr(domForm->typname)),
+									 "default", ObjTypeString,
+									 DomainGetDefault(domTup, false));
+			break;
+		case 'N':
+			/* DROP NOT NULL */
+			ret = new_objtree_VA("ALTER DOMAIN %{identity}D DROP NOT NULL", 2,
+									  "type", ObjTypeString, "drop not null",
+									  "identity", ObjTypeObject,
+									  new_objtree_for_qualname(domForm->typnamespace,
+															   NameStr(domForm->typname)));
+			break;
+		case 'O':
+			/* SET NOT NULL */
+			ret = new_objtree_VA("ALTER DOMAIN %{identity}D SET NOT NULL", 2,
+								 "type", ObjTypeString, "set not null",
+								 "identity", ObjTypeObject,
+								 new_objtree_for_qualname(domForm->typnamespace,
+														  NameStr(domForm->typname)));
+			break;
+		case 'C':
+			/*
+			 * ADD CONSTRAINT.  Only CHECK constraints are supported by
+			 * domains
+			 */
+			ret = new_objtree_VA("ALTER DOMAIN %{identity}D ADD CONSTRAINT %{constraint_name}s %{definition}s", 4,
+								 "type", ObjTypeString, "add constraint",
+								 "identity", ObjTypeObject,
+								 new_objtree_for_qualname(domForm->typnamespace,
+														  NameStr(domForm->typname)),
+								 "constraint_name", ObjTypeString,
+								 get_constraint_name(constraintAddr.objectId),
+								 "definition", ObjTypeString,
+								 pg_get_constraintdef_string(constraintAddr.objectId));
+			break;
+		case 'V':
+			/* VALIDATE CONSTRAINT */
+			/*
+			 * Process subtype=specific options. Validation a constraint
+			 * requires its name.
+			 */
+			ret = new_objtree_VA("ALTER DOMAIN %{identity}D VALIDATE CONSTRAINT %{constraint_name}s", 3,
+								 "type", ObjTypeString, "validate constraint",
+								 "identity", ObjTypeObject,
+								 new_objtree_for_qualname(domForm->typnamespace,
+														  NameStr(domForm->typname)),
+								 "constraint_name", ObjTypeString, node->name);
+			break;
+		case 'X':
+			{
+				ObjTree    *tmp_obj;
+
+				/* DROP CONSTRAINT */
+				ret = new_objtree_VA("ALTER DOMAIN %{identity}D DROP CONSTRAINT IF EXISTS %{constraint_name}s", 3,
+										"type", ObjTypeString, "drop constraint",
+										"identity", ObjTypeObject,
+										new_objtree_for_qualname(domForm->typnamespace,
+																NameStr(domForm->typname)),
+										"constraint_name", ObjTypeString, node->name);
+
+				tmp_obj = new_objtree_VA("CASCADE", 1,
+										"present", ObjTypeBool, node->behavior == DROP_CASCADE);
+
+				append_object_object(ret, "%{cascade}s", tmp_obj);
+			}
+			break;
+		default:
+			elog(ERROR, "invalid subtype %c", node->subtype);
+	}
+
+	/* Done */
+	ReleaseSysCache(domTup);
+
+	return ret;
+}
+
+/*
+ * Deparse a CreateStatsStmt.
+ *
+ * Given a statistics OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE STATISTICS %{if_not_exists}s %{identity}D ON %{expr:, }s FROM %{stat_table_identity}D
+ */
+static ObjTree *
+deparse_CreateStatisticsStmt(Oid objectId, Node *parsetree)
+{
+	CreateStatsStmt *node = (CreateStatsStmt *) parsetree;
+	Form_pg_statistic_ext statform;
+	ObjTree    *ret;
+	HeapTuple	tup;
+	Datum		datum;
+	bool		isnull;
+	List	   *statexprs = NIL;
+
+	tup = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for statistic with OID %u", objectId);
+
+	statform = (Form_pg_statistic_ext) GETSTRUCT(tup);
+
+	ret = new_objtree_VA("CREATE STATISTICS %{if_not_exists}s %{identity}D", 2,
+						 "if_not_exists", ObjTypeString,
+						 node->if_not_exists ? "IF NOT EXISTS" : "",
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(statform->stxnamespace,
+												  NameStr(statform->stxname)));
+
+	datum = SysCacheGetAttr(STATEXTOID, tup, Anum_pg_statistic_ext_stxexprs,
+							&isnull);
+	if (!isnull)
+	{
+		ListCell   *lc;
+		Relation	statsrel;
+		List	   *context;
+		List	   *exprs = NIL;
+		char	   *exprsString;
+
+		statsrel = relation_open(statform->stxrelid, AccessShareLock);
+		context = deparse_context_for(RelationGetRelationName(statsrel),
+									  RelationGetRelid(statsrel));
+
+		exprsString = TextDatumGetCString(datum);
+		exprs = (List *) stringToNode(exprsString);
+
+		foreach(lc, exprs)
+		{
+			Node	   *expr = (Node *) lfirst(lc);
+			char	   *statexpr;
+
+			statexpr = deparse_expression(expr, context, false, false);
+			statexprs = lappend(statexprs, new_string_object(statexpr));
+		}
+
+		append_array_object(ret, "ON %{expr:, }s", statexprs);
+		pfree(exprsString);
+		relation_close(statsrel, AccessShareLock);
+	}
+
+	datum = SysCacheGetAttr(STATEXTOID, tup, Anum_pg_statistic_ext_stxkeys,
+							&isnull);
+	if (!isnull)
+	{
+		int			keyno;
+		char	   *attname;
+		List	   *statcols = NIL;
+		int2vector *indoption;
+
+		indoption = (int2vector *) DatumGetPointer(datum);
+
+		for (keyno = 0; keyno < indoption->dim1; keyno++)
+		{
+			attname = get_attname(statform->stxrelid, indoption->values[keyno],
+								  false);
+			statcols = lappend(statcols, new_string_object(attname));
+		}
+
+		if (indoption->dim1)
+		{
+			/* Append a ',' if statexprs is present else append 'ON' */
+			append_string_object(ret, "%{comma}s", "comma",
+								 statexprs ? "," : "ON");
+			append_array_object(ret, "%{cols:, }s", statcols);
+		}
+	}
+
+	append_object_object(ret, "FROM %{stat_table_identity}D",
+						 new_objtree_for_qualname(get_rel_namespace(statform->stxrelid),
+												  get_rel_name(statform->stxrelid)));
+
+	ReleaseSysCache(tup);
+
+	return ret;
+}
+
+/*
+ * Deparse an CreateForeignServerStmt (CREATE SERVER)
+ *
+ * Given a server OID and the parse tree that created it, return an ObjTree
+ * representing the alter command.
+ *
+ * Verbose syntax
+ * CREATE SERVER %{identity}I %{type}s %{version}s FOREIGN DATA WRAPPER %{fdw}I
+ * %{generic_options}s
+ */
+static ObjTree *
+deparse_CreateForeignServerStmt(Oid objectId, Node *parsetree)
+{
+	CreateForeignServerStmt *node = (CreateForeignServerStmt *) parsetree;
+	ObjTree    *ret;
+	ObjTree    *tmp;
+
+	ret = new_objtree_VA("CREATE SERVER %{identity}I", 1,
+						 "identity", ObjTypeString, node->servername);
+
+	/* Add a TYPE clause, if any */
+	tmp = new_objtree("TYPE");
+	if (node->servertype)
+		append_string_object(tmp, "%{type}L", "type", node->servertype);
+	else
+		append_not_present(tmp);
+	append_object_object(ret, "%{type}s", tmp);
+
+	/* Add a VERSION clause, if any */
+	tmp = new_objtree("VERSION");
+	if (node->version)
+		append_string_object(tmp, "%{version}L", "version", node->version);
+	else
+		append_not_present(tmp);
+	append_object_object(ret, "%{version}s", tmp);
+
+	append_string_object(ret, "FOREIGN DATA WRAPPER %{fdw}I", "fdw",
+						 node->fdwname);
+
+	/* Add an OPTIONS clause, if any */
+	append_object_object(ret, "%{generic_options}s",
+						 deparse_FdwOptions(node->options, NULL, false));
+
+	return ret;
+}
+
+/*
+ * Deparse an AlterForeignServerStmt (ALTER SERVER)
+ *
+ * Given a server OID and the parse tree that created it, return an ObjTree
+ * representing the alter command.
+ *
+ * Verbose syntax
+ * ALTER SERVER %{identity}I %{version}s %{generic_options}s
+ */
+static ObjTree *
+deparse_AlterForeignServerStmt(Oid objectId, Node *parsetree)
+{
+	AlterForeignServerStmt *node = (AlterForeignServerStmt *) parsetree;
+	ObjTree    *tmp;
+
+	/* Add a VERSION clause, if any */
+	tmp = new_objtree("VERSION");
+	if (node->has_version && node->version)
+		append_string_object(tmp, "%{version}L", "version", node->version);
+	else if (node->has_version)
+		append_string_object(tmp, "version", "version", "NULL");
+	else
+		append_not_present(tmp);
+
+	return new_objtree_VA("ALTER SERVER %{identity}I %{version}s %{generic_options}s", 3,
+						  "identity", ObjTypeString, node->servername,
+						  "version", ObjTypeObject, tmp,
+						  "generic_options", ObjTypeObject,
+						  deparse_FdwOptions(node->options, NULL, false));
+}
+
+/*
+ * Deparse a CreatePLangStmt.
+ *
+ * Given a language OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE %{or_replace}s %{trusted}s LANGUAGE %{identity}s HANDLER %{handler}D
+ * %{inline}s %{validator}s
+ */
+static ObjTree *
+deparse_CreateLangStmt(Oid objectId, Node *parsetree)
+{
+	CreatePLangStmt *node = (CreatePLangStmt *) parsetree;
+	ObjTree    *ret;
+	ObjTree    *tmp;
+	HeapTuple	langTup;
+	Form_pg_language langForm;
+
+	langTup = SearchSysCache1(LANGOID,
+							  ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(langTup))
+		elog(ERROR, "cache lookup failed for language with OID %u", objectId);
+	langForm = (Form_pg_language) GETSTRUCT(langTup);
+
+	ret = new_objtree_VA("CREATE %{or_replace}s %{trusted}s LANGUAGE %{identity}s", 3,
+						 "or_replace", ObjTypeString,
+						 node->replace ? "OR REPLACE" : "",
+						 "trusted", ObjTypeString,
+						 langForm->lanpltrusted ? "TRUSTED" : "",
+						 "identity", ObjTypeString, node->plname);
+
+	if (node->plhandler != NIL)
+	{
+		/* Add the HANDLER clause */
+		append_object_object(ret, "HANDLER %{handler}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 langForm->lanplcallfoid));
+
+		/* Add the INLINE clause, if any */
+		tmp = new_objtree("INLINE");
+		if (OidIsValid(langForm->laninline))
+		{
+			append_object_object(tmp, "%{handler_name}D",
+								 new_objtree_for_qualname_id(ProcedureRelationId,
+															 langForm->laninline));
+		}
+		else
+			append_not_present(tmp);
+		append_object_object(ret, "%{inline}s", tmp);
+
+		/* Add the VALIDATOR clause, if any */
+		tmp = new_objtree("VALIDATOR");
+		if (OidIsValid(langForm->lanvalidator))
+		{
+			append_object_object(tmp, "%{handler_name}D",
+								 new_objtree_for_qualname_id(ProcedureRelationId,
+															 langForm->lanvalidator));
+		}
+		else
+			append_not_present(tmp);
+		append_object_object(ret, "%{validator}s", tmp);
+	}
+
+	ReleaseSysCache(langTup);
+
+	return ret;
+}
+
+/*
+ * Deparse a CreateForeignTableStmt (CREATE FOREIGN TABLE).
+ *
+ * Given a table OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * CREATE FOREIGN TABLE %{if_not_exists}s %{identity}D
+ * [(%{table_elements:, }s) %{inherits}s
+ *  | PARTITION OF %{parent_identity}D (%{typed_table_elements:, }s) %{partition_bound}s]
+ * SERVER %{server}I %{generic_options}s
+ */
+static ObjTree *
+deparse_CreateForeignTableStmt(Oid objectId, Node *parsetree)
+{
+	CreateForeignTableStmt *stmt = (CreateForeignTableStmt *) parsetree;
+	Relation	relation = relation_open(objectId, AccessShareLock);
+	List	   *dpcontext;
+	ObjTree    *createStmt;
+	ObjTree    *tmpobj;
+	List	   *tableelts = NIL;
+
+	createStmt = new_objtree("CREATE FOREIGN TABLE");
+
+	append_string_object(createStmt, "%{if_not_exists}s", "if_not_exists",
+						 stmt->base.if_not_exists ? "IF NOT EXISTS" : "");
+
+	tmpobj = new_objtree_for_qualname(relation->rd_rel->relnamespace,
+								   RelationGetRelationName(relation));
+	append_object_object(createStmt, "%{identity}D", tmpobj);
+
+	dpcontext = deparse_context_for(RelationGetRelationName(relation),
+									objectId);
+	if (stmt->base.partbound)
+	{
+		/* Partitioned table */
+		List	   *parents;
+		ObjElem    *elem;
+
+		parents = deparse_InhRelations(objectId);
+		elem = (ObjElem *) linitial(parents);
+
+		Assert(list_length(parents) == 1);
+
+		append_format_string(createStmt, "PARTITION OF");
+
+		append_object_object(createStmt, "%{parent_identity}D",
+										 elem->value.object);
+
+		tableelts = deparse_TableElements(relation, stmt->base.tableElts, dpcontext,
+										  true, /* typed table */
+										  false);	/* not composite */
+		tableelts = obtainConstraints(tableelts, objectId, InvalidOid);
+
+		tmpobj = new_objtree("");
+		if (tableelts)
+			append_array_object(tmpobj, "(%{elements:, }s)", tableelts);
+		else
+			append_not_present(tmpobj);
+
+		append_object_object(createStmt, "%{typed_table_elements}s", tmpobj);
+
+		/*
+		 * Add the partition_bound_spec, i.e. the FOR VALUES clause.
+		 * Get pg_class.relpartbound. We cannot use partbound in the parsetree
+		 * directly as it's the original partbound expression which haven't
+		 * been transformed.
+		 */
+		append_string_object(createStmt, "%{partition_bound}s", "partition_bound",
+							 RelationGetPartitionBound(objectId));
+
+		/* No PARTITION BY clause for CREATE FOREIGN TABLE */
+	}
+	else
+	{
+		tableelts = deparse_TableElements(relation, stmt->base.tableElts, dpcontext,
+										  false,		/* not typed table */
+										  false);	/* not composite */
+		tableelts = obtainConstraints(tableelts, objectId, InvalidOid);
+
+		if (tableelts)
+			append_array_object(createStmt, "(%{table_elements:, }s)", tableelts);
+		else
+			append_format_string(createStmt, "()");
+
+		/*
+		* Add inheritance specification.  We cannot simply scan the list of
+		* parents from the parser node, because that may lack the actual
+		* qualified names of the parent relations.  Rather than trying to
+		* re-resolve them from the information in the parse node, it seems
+		* more accurate and convenient to grab it from pg_inherits.
+		*/
+		tmpobj = new_objtree("INHERITS");
+		if (stmt->base.inhRelations != NIL)
+			append_array_object(tmpobj, "(%{parents:, }D)", deparse_InhRelations(objectId));
+		else
+		{
+			append_null_object(tmpobj, "(%{parents:, }D)");
+			append_not_present(tmpobj);
+		}
+		append_object_object(createStmt, "%{inherits}s", tmpobj);
+	}
+
+	append_string_object(createStmt, "SERVER %{server}I", "server", stmt->servername);
+
+	/* add an OPTIONS clause, if any */
+	append_object_object(createStmt, "%{generic_options}s",
+						 deparse_FdwOptions(stmt->options, NULL, false));
+
+	relation_close(relation, AccessShareLock);
+
+	return createStmt;
+}
+
+/*
+ * Deparse a DefineStmt.
+ */
+static ObjTree *
+deparse_DefineStmt(Oid objectId, Node *parsetree, ObjectAddress secondaryObj)
+{
+	DefineStmt *define = (DefineStmt *) parsetree;
+
+	switch (define->kind)
+	{
+		case OBJECT_AGGREGATE:
+			return deparse_DefineStmt_Aggregate(objectId, define);
+
+		case OBJECT_COLLATION:
+			return deparse_DefineStmt_Collation(objectId, define, secondaryObj);
+
+		case OBJECT_OPERATOR:
+			return deparse_DefineStmt_Operator(objectId, define);
+
+		case OBJECT_TSCONFIGURATION:
+			return deparse_DefineStmt_TSConfig(objectId, define, secondaryObj);
+
+		case OBJECT_TSDICTIONARY:
+			return deparse_DefineStmt_TSDictionary(objectId, define);
+
+		case OBJECT_TSPARSER:
+			return deparse_DefineStmt_TSParser(objectId, define);
+
+		case OBJECT_TSTEMPLATE:
+			return deparse_DefineStmt_TSTemplate(objectId, define);
+
+		case OBJECT_TYPE:
+			return deparse_DefineStmt_Type(objectId, define);
+
+		default:
+			elog(ERROR, "unsupported object kind: %d", define->kind);
+	}
+
+	return NULL;
+}
+
+/*
+ * Form an ObjElem to be used as a single argument in an aggregate argument
+ * list
+ */
+static ObjElem *
+form_agg_argument(int idx, char *modes, char **names, Oid *types)
+{
+	ObjTree	   *arg;
+
+	arg = new_objtree("");
+
+	append_string_object(arg, "%{mode}s", "mode",
+						 (modes && modes[idx] == 'v') ? "VARIADIC" : "");
+	append_string_object(arg, "%{name}s", "name", names ? names[idx] : "");
+	append_object_object(arg, "%{type}T",
+						 new_objtree_for_type(types[idx], -1));
+
+	return new_object_object(arg);
+}
+
+/*
+ * Deparse a DefineStmt (CREATE AGGREGATE)
+ *
+ * Given a aggregate OID, return an ObjTree representing the CREATE command.
+ *
+ * Verbose syntax
+ * CREATE AGGREGATE %{identity}D(%{types}s) (%{elems:, }s)
+ */
+static ObjTree *
+deparse_DefineStmt_Aggregate(Oid objectId, DefineStmt *define)
+{
+	HeapTuple   aggTup;
+	HeapTuple   procTup;
+	ObjTree	   *stmt;
+	ObjTree	   *tmp;
+	List	   *list;
+	Datum		initval;
+	bool		isnull;
+	Form_pg_aggregate agg;
+	Form_pg_proc proc;
+	Form_pg_operator op;
+	HeapTuple	tup;
+
+	aggTup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(aggTup))
+		elog(ERROR, "cache lookup failed for aggregate with OID %u", objectId);
+	agg = (Form_pg_aggregate) GETSTRUCT(aggTup);
+
+	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(agg->aggfnoid));
+	if (!HeapTupleIsValid(procTup))
+		elog(ERROR, "cache lookup failed for procedure with OID %u",
+			 agg->aggfnoid);
+	proc = (Form_pg_proc) GETSTRUCT(procTup);
+
+	stmt = new_objtree("CREATE AGGREGATE");
+
+	append_object_object(stmt, "%{identity}D",
+						 new_objtree_for_qualname(proc->pronamespace,
+												  NameStr(proc->proname)));
+
+	/*
+	 * Add the argument list.  There are three cases to consider:
+	 *
+	 * 1. no arguments, in which case the signature is (*).
+	 *
+	 * 2. Not an ordered-set aggregate.  In this case there's one or more
+	 * arguments.
+	 *
+	 * 3. Ordered-set aggregates. These have zero or more direct arguments, and
+	 * one or more ordered arguments.
+	 *
+	 * We don't need to consider default values or table parameters, and the
+	 * only mode that we need to consider is VARIADIC.
+	 */
+
+	if (proc->pronargs == 0)
+		append_string_object(stmt, "(%{types}s)", "types", "*");
+	else if (!AGGKIND_IS_ORDERED_SET(agg->aggkind))
+	{
+		int			i;
+		int			nargs;
+		Oid		   *types;
+		char	   *modes;
+		char	  **names;
+
+		nargs = get_func_arg_info(procTup, &types, &names, &modes);
+
+		/* only direct arguments in this case */
+		list = NIL;
+		for (i = 0; i < nargs; i++)
+		{
+			list = lappend(list, form_agg_argument(i, modes, names, types));
+		}
+
+		tmp = new_objtree_VA("%{direct:, }s", 1,
+							 "direct", ObjTypeArray, list);
+		append_object_object(stmt, "(%{types}s)", tmp);
+	}
+	else
+	{
+		int			i;
+		int			nargs;
+		Oid		   *types;
+		char	   *modes;
+		char	  **names;
+
+		nargs = get_func_arg_info(procTup, &types, &names, &modes);
+
+		/* direct arguments ... */
+		list = NIL;
+		for (i = 0; i < agg->aggnumdirectargs; i++)
+		{
+			list = lappend(list, form_agg_argument(i, modes, names, types));
+		}
+		tmp = new_objtree_VA("%{direct:, }s", 1,
+							 "direct", ObjTypeArray, list);
+
+		/*
+		 * ... and aggregated arguments.  If the last direct argument is
+		 * VARIADIC, we need to repeat it here rather than searching for more
+		 * arguments.  (See aggr_args production in gram.y for an explanation.)
+		 */
+		if (modes && modes[agg->aggnumdirectargs - 1] == 'v')
+		{
+			list = list_make1(form_agg_argument(agg->aggnumdirectargs - 1,
+												modes, names, types));
+		}
+		else
+		{
+			list = NIL;
+			for (i = agg->aggnumdirectargs; i < nargs; i++)
+			{
+				list = lappend(list, form_agg_argument(i, modes, names, types));
+			}
+		}
+		append_array_object(tmp, "ORDER BY %{aggregated:, }s", list);
+
+		append_object_object(stmt, "(%{types}s)", tmp);
+	}
+
+	/* Add the definition clause */
+	list = NIL;
+
+	/* SFUNC */
+	tmp = new_objtree_VA("SFUNC=%{procedure}D", 1,
+						 "procedure", ObjTypeObject,
+						 new_objtree_for_qualname_id(ProcedureRelationId, agg->aggtransfn));
+	list = lappend(list, new_object_object(tmp));
+
+	/* STYPE */
+	tmp = new_objtree_VA("STYPE=%{type}T", 1,
+						 "type", ObjTypeObject,
+						 new_objtree_for_type(agg->aggtranstype, -1));
+	list = lappend(list, new_object_object(tmp));
+
+	/* SSPACE */
+	tmp = new_objtree("SSPACE=");
+	if (agg->aggtransspace != 0)
+		append_int_object(tmp,"%{space}n", agg->aggtransspace);
+	else
+		append_not_present(tmp);
+
+	list = lappend(list, new_object_object(tmp));
+
+	/* FINALFUNC */
+	tmp = new_objtree("FINALFUNC=");
+	if (OidIsValid(agg->aggfinalfn))
+		append_object_object(tmp, "%{procedure}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 agg->aggfinalfn));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* FINALFUNC_EXTRA */
+	tmp = new_objtree("FINALFUNC_EXTRA=");
+	if (agg->aggfinalextra)
+		append_string_object(tmp, "%{value}s", "value", "true");
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* INITCOND */
+	initval = SysCacheGetAttr(AGGFNOID, aggTup,
+							  Anum_pg_aggregate_agginitval,
+							  &isnull);
+	tmp = new_objtree("INITCOND=");
+	if (!isnull)
+		append_string_object(tmp,"%{initval}L", "initval", TextDatumGetCString(initval));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* MSFUNC */
+	tmp = new_objtree("MSFUNC=");
+	if (OidIsValid(agg->aggmtransfn))
+		append_object_object(tmp, "%{procedure}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId, agg->aggmtransfn));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* MSTYPE */
+	tmp = new_objtree("MSTYPE=");
+	if (OidIsValid(agg->aggmtranstype))
+		append_object_object(tmp, "%{type}T", new_objtree_for_type(agg->aggmtranstype, -1));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* MSSPACE */
+	tmp = new_objtree("MSSPACE=");
+	if (agg->aggmtransspace != 0)
+		append_int_object(tmp, "%{space}n", agg->aggmtransspace);
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* MINVFUNC */
+	tmp = new_objtree("MINVFUNC=");
+	if (OidIsValid(agg->aggminvtransfn))
+		append_object_object(tmp, "%{type}T", new_objtree_for_qualname_id(ProcedureRelationId,
+															agg->aggminvtransfn));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* MFINALFUNC */
+	tmp = new_objtree("MFINALFUNC=");
+	if (OidIsValid(agg->aggmfinalfn))
+		append_object_object(tmp, "%{procedure}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 agg->aggmfinalfn));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* MFINALFUNC_EXTRA */
+	tmp = new_objtree("MFINALFUNC_EXTRA=");
+	if (agg->aggmfinalextra)
+		append_string_object(tmp, "%{value}s", "value", "true");
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* MINITCOND */
+	initval = SysCacheGetAttr(AGGFNOID, aggTup,
+							  Anum_pg_aggregate_aggminitval,
+							  &isnull);
+	tmp = new_objtree("MINITCOND=");
+	if (!isnull)
+		append_string_object(tmp, "%{initval}L", "initval", TextDatumGetCString(initval));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* HYPOTHETICAL */
+	tmp = new_objtree("HYPOTHETICAL=");
+	if (agg->aggkind == AGGKIND_HYPOTHETICAL)
+		append_string_object(tmp, "%{value}s", "value", "true");
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* SORTOP */
+	tmp = new_objtree("SORTOP=");
+	if (OidIsValid(agg->aggsortop))
+	{
+		tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(agg->aggsortop));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for operator with OID %u", agg->aggsortop);
+		op = (Form_pg_operator) GETSTRUCT(tup);
+		append_object_object(tmp, "%{operator}D",
+							 new_objtree_for_qualname(op->oprnamespace,
+													  NameStr(op->oprname)));
+
+		ReleaseSysCache(tup);
+	}
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* Done with the definition clause */
+	append_array_object(stmt, "(%{elems:, }s)", list);
+
+	ReleaseSysCache(procTup);
+	ReleaseSysCache(aggTup);
+
+	return stmt;
+}
+
+/*
+ * Deparse a DefineStmt (CREATE COLLATION)
+ *
+ * Given a collation OID, return an ObjTree representing the CREATE command.
+ *
+ * Verbose syntax
+ * CREATE COLLATION %{identity}D FROM %{from_identity}D (%{elems:, }s)
+ */
+static ObjTree *
+deparse_DefineStmt_Collation(Oid objectId, DefineStmt *define,
+							 ObjectAddress fromCollid)
+{
+	ObjTree    *ret;
+	HeapTuple	colTup;
+	Form_pg_collation colForm;
+	Datum		datum;
+	bool		isnull;
+	ObjTree    *tmp;
+	List	   *list = NIL;
+
+	colTup = SearchSysCache1(COLLOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(colTup))
+		elog(ERROR, "cache lookup failed for collation with OID %u", objectId);
+	colForm = (Form_pg_collation) GETSTRUCT(colTup);
+
+	ret = new_objtree_VA("CREATE COLLATION %{identity}D", 1,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(colForm->collnamespace,
+												  NameStr(colForm->collname)));
+
+	if (OidIsValid(fromCollid.objectId))
+	{
+		Oid			collid = fromCollid.objectId;
+		HeapTuple	tp;
+		Form_pg_collation fromColForm;
+
+		/*
+		 * CREATE COLLATION %{identity}D FROM existing_collation;
+		 */
+		tp = SearchSysCache1(COLLOID, ObjectIdGetDatum(collid));
+		if (!HeapTupleIsValid(tp))
+			elog(ERROR, "cache lookup failed for collation with OID %u", collid);
+
+		fromColForm = (Form_pg_collation) GETSTRUCT(tp);
+
+		append_object_object(ret, "FROM %{from_identity}D",
+							 new_objtree_for_qualname(fromColForm->collnamespace,
+													  NameStr(fromColForm->collname)));
+
+		ReleaseSysCache(tp);
+		ReleaseSysCache(colTup);
+		return ret;
+	}
+
+	/* LOCALE */
+	datum = SysCacheGetAttr(COLLOID, colTup, Anum_pg_collation_colliculocale, &isnull);
+	if (!isnull)
+	{
+		tmp = new_objtree_VA("LOCALE=%{locale}L", 2,
+							 "clause", ObjTypeString, "locale",
+							 "locale", ObjTypeString,
+							 psprintf("%s", TextDatumGetCString(datum)));
+		list = lappend(list, new_object_object(tmp));
+	}
+
+	/* LC_COLLATE */
+	datum = SysCacheGetAttr(COLLOID, colTup, Anum_pg_collation_collcollate, &isnull);
+	if (!isnull)
+	{
+		tmp = new_objtree_VA("LC_COLLATE=%{collate}L", 2,
+							 "clause", ObjTypeString, "collate",
+							 "collate", ObjTypeString,
+							 psprintf("%s", TextDatumGetCString(datum)));
+		list = lappend(list, new_object_object(tmp));
+	}
+
+	/* LC_CTYPE */
+	datum = SysCacheGetAttr(COLLOID, colTup, Anum_pg_collation_collctype, &isnull);
+	if (!isnull)
+	{
+		tmp = new_objtree_VA("LC_CTYPE=%{ctype}L", 2,
+							 "clause", ObjTypeString, "ctype",
+							 "ctype", ObjTypeString,
+							 psprintf("%s", TextDatumGetCString(datum)));
+		list = lappend(list, new_object_object(tmp));
+	}
+
+	/* PROVIDER */
+	if (colForm->collprovider == COLLPROVIDER_ICU)
+	{
+		tmp = new_objtree_VA("PROVIDER=%{provider}L", 2,
+							 "clause", ObjTypeString, "provider",
+							 "provider", ObjTypeString,
+							 psprintf("%s", "icu"));
+		list = lappend(list, new_object_object(tmp));
+	}
+	else if (colForm->collprovider == COLLPROVIDER_LIBC)
+	{
+		tmp = new_objtree_VA("PROVIDER=%{provider}L", 2,
+							 "clause", ObjTypeString, "provider",
+							 "provider", ObjTypeString,
+							 psprintf("%s", "libc"));
+		list = lappend(list, new_object_object(tmp));
+	}
+
+	/* DETERMINISTIC */
+	if (colForm->collisdeterministic)
+	{
+		tmp = new_objtree_VA("DETERMINISTIC=%{deterministic}L", 2,
+							 "clause", ObjTypeString, "deterministic",
+							 "deterministic", ObjTypeString,
+							 psprintf("%s", "true"));
+		list = lappend(list, new_object_object(tmp));
+	}
+
+	/* VERSION */
+	datum = SysCacheGetAttr(COLLOID, colTup, Anum_pg_collation_collversion, &isnull);
+	if (!isnull)
+	{
+		tmp = new_objtree_VA("VERSION=%{version}L", 2,
+							 "clause", ObjTypeString, "version",
+							 "version", ObjTypeString,
+							 psprintf("%s", TextDatumGetCString(datum)));
+		list = lappend(list, new_object_object(tmp));
+	}
+
+	append_array_object(ret, "(%{elems:, }s)", list);
+	ReleaseSysCache(colTup);
+
+	return ret;
+}
+
+/*
+ * Deparse a DefineStmt (CREATE OPERATOR)
+ *
+ * Given a operator OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE OPERATOR %{identity}O (%{elems:, }s)
+ */
+static ObjTree *
+deparse_DefineStmt_Operator(Oid objectId, DefineStmt *define)
+{
+	HeapTuple	oprTup;
+	ObjTree    *ret;
+	ObjTree    *tmp_obj;
+	List	   *list = NIL;
+	Form_pg_operator oprForm;
+
+	oprTup = SearchSysCache1(OPEROID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(oprTup))
+		elog(ERROR, "cache lookup failed for operator with OID %u", objectId);
+	oprForm = (Form_pg_operator) GETSTRUCT(oprTup);
+
+	ret = new_objtree_VA("CREATE OPERATOR %{identity}O", 1,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(oprForm->oprnamespace,
+												  NameStr(oprForm->oprname)));
+
+	/* PROCEDURE */
+	tmp_obj = new_objtree_VA("PROCEDURE=%{procedure}D", 2,
+							"clause", ObjTypeString, "procedure",
+							"procedure", ObjTypeObject,
+							new_objtree_for_qualname_id(ProcedureRelationId,
+														oprForm->oprcode));
+	list = lappend(list, new_object_object(tmp_obj));
+
+	/* LEFTARG */
+	tmp_obj = new_objtree_VA("LEFTARG=", 1,
+							"clause", ObjTypeString, "leftarg");
+	if (OidIsValid(oprForm->oprleft))
+		append_object_object(tmp_obj, "%{type}T",
+							 new_objtree_for_type(oprForm->oprleft, -1));
+	else
+		append_not_present(tmp_obj);
+	list = lappend(list, new_object_object(tmp_obj));
+
+	/* RIGHTARG */
+	tmp_obj = new_objtree_VA("RIGHTARG=", 1,
+							"clause", ObjTypeString, "rightarg");
+	if (OidIsValid(oprForm->oprright))
+		append_object_object(tmp_obj, "%{type}T",
+							 new_objtree_for_type(oprForm->oprright, -1));
+	else
+		append_not_present(tmp_obj);
+	list = lappend(list, new_object_object(tmp_obj));
+
+	/* COMMUTATOR */
+	tmp_obj = new_objtree_VA("COMMUTATOR=", 1,
+							"clause", ObjTypeString, "commutator");
+	if (OidIsValid(oprForm->oprcom))
+		append_object_object(tmp_obj, "%{oper}D",
+							 new_objtree_for_qualname_id(OperatorRelationId,
+														 oprForm->oprcom));
+	else
+		append_not_present(tmp_obj);
+	list = lappend(list, new_object_object(tmp_obj));
+
+	/* NEGATOR */
+	tmp_obj = new_objtree_VA("NEGATOR=", 1,
+							"clause", ObjTypeString, "negator");
+	if (OidIsValid(oprForm->oprnegate))
+		append_object_object(tmp_obj, "%{oper}D",
+							 new_objtree_for_qualname_id(OperatorRelationId,
+														 oprForm->oprnegate));
+	else
+		append_not_present(tmp_obj);
+	list = lappend(list, new_object_object(tmp_obj));
+
+	/* RESTRICT */
+	tmp_obj = new_objtree_VA("RESTRICT=", 1,
+							"clause", ObjTypeString, "restrict");
+	if (OidIsValid(oprForm->oprrest))
+		append_object_object(tmp_obj, "%{procedure}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 oprForm->oprrest));
+	else
+		append_not_present(tmp_obj);
+	list = lappend(list, new_object_object(tmp_obj));
+
+	/* JOIN */
+	tmp_obj = new_objtree_VA("JOIN=", 1,
+							"clause", ObjTypeString, "join");
+	if (OidIsValid(oprForm->oprjoin))
+		append_object_object(tmp_obj, "%{procedure}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 oprForm->oprjoin));
+	else
+		append_not_present(tmp_obj);
+	list = lappend(list, new_object_object(tmp_obj));
+
+	/* HASHES */
+	tmp_obj = new_objtree_VA("HASHES", 1,
+							"clause", ObjTypeString, "hashes");
+	if (!oprForm->oprcanhash)
+		append_not_present(tmp_obj);
+	list = lappend(list, new_object_object(tmp_obj));
+
+	/* MERGES */
+	tmp_obj = new_objtree_VA("MERGES", 1,
+							"clause", ObjTypeString, "merges");
+	if (!oprForm->oprcanmerge)
+		append_not_present(tmp_obj);
+	list = lappend(list, new_object_object(tmp_obj));
+
+	append_array_object(ret, "(%{elems:, }s)", list);
+
+	ReleaseSysCache(oprTup);
+
+	return ret;
+}
+
+/*
+ * Deparse a CREATE TYPE statement.
+ *
+ * Verbose syntax
+ * CREATE TYPE %{identity}D %{elems:, }s)
+ */
+static ObjTree *
+deparse_DefineStmt_Type(Oid objectId, DefineStmt *define)
+{
+	HeapTuple	typTup;
+	ObjTree    *ret;
+	ObjTree    *tmp;
+	List	   *list = NIL;
+	char	   *str;
+	Datum		dflt;
+	bool		isnull;
+	Form_pg_type typForm;
+
+	typTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(typTup))
+		elog(ERROR, "cache lookup failed for type with OID %u", objectId);
+	typForm = (Form_pg_type) GETSTRUCT(typTup);
+
+	ret = new_objtree_VA("CREATE TYPE %{identity}D", 1,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(typForm->typnamespace,
+												  NameStr(typForm->typname)));
+
+	/* Shell types. */
+	if (!typForm->typisdefined)
+	{
+		ReleaseSysCache(typTup);
+		return ret;
+	}
+
+	/* Add the definition clause */
+	/* INPUT */
+	tmp = new_objtree_VA("(INPUT=%{procedure}D", 2,
+						 "clause", ObjTypeString, "input",
+						 "procedure", ObjTypeObject,
+						 new_objtree_for_qualname_id(ProcedureRelationId,
+													 typForm->typinput));
+	list = lappend(list, new_object_object(tmp));
+
+	/* OUTPUT */
+	tmp = new_objtree_VA("OUTPUT=%{procedure}D", 2,
+						 "clause", ObjTypeString, "output",
+						 "procedure", ObjTypeObject,
+						 new_objtree_for_qualname_id(ProcedureRelationId,
+													 typForm->typoutput));
+	list = lappend(list, new_object_object(tmp));
+
+	/* RECEIVE */
+	tmp = new_objtree_VA("RECEIVE=", 1,
+						 "clause", ObjTypeString, "receive");
+	if (OidIsValid(typForm->typreceive))
+		append_object_object(tmp, "%{procedure}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 typForm->typreceive));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* SEND */
+	tmp = new_objtree_VA("SEND=", 1,
+						 "clause", ObjTypeString, "send");
+	if (OidIsValid(typForm->typsend))
+		append_object_object(tmp, "%{procedure}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 typForm->typsend));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* TYPMOD_IN */
+	tmp = new_objtree_VA("TYPMOD_IN=", 1,
+						 "clause", ObjTypeString, "typmod_in");
+	if (OidIsValid(typForm->typmodin))
+		append_object_object(tmp, "%{procedure}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 typForm->typmodin));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* TYPMOD_OUT */
+	tmp = new_objtree_VA("TYPMOD_OUT=", 1,
+						 "clause", ObjTypeString, "typmod_out");
+	if (OidIsValid(typForm->typmodout))
+		append_object_object(tmp, "%{procedure}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 typForm->typmodout));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* ANALYZE */
+	tmp = new_objtree_VA("ANALYZE=", 1,
+						 "clause", ObjTypeString, "analyze");
+	if (OidIsValid(typForm->typanalyze))
+		append_object_object(tmp, "%{procedure}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 typForm->typanalyze));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* INTERNALLENGTH */
+	if (typForm->typlen == -1)
+		tmp = new_objtree("INTERNALLENGTH=VARIABLE");
+	else
+		tmp = new_objtree_VA("INTERNALLENGTH=%{typlen}n", 1,
+							 "typlen", ObjTypeInteger, typForm->typlen);
+
+	list = lappend(list, new_object_object(tmp));
+
+	/* PASSEDBYVALUE */
+	tmp = new_objtree_VA("PASSEDBYVALUE", 1,
+						 "clause", ObjTypeString, "passedbyvalue");
+	if (!typForm->typbyval)
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* XXX it's odd to represent alignment with schema-qualified type names */
+	switch (typForm->typalign)
+	{
+		case 'd':
+			str = "pg_catalog.float8";
+			break;
+		case 'i':
+			str = "pg_catalog.int4";
+			break;
+		case 's':
+			str = "pg_catalog.int2";
+			break;
+		case 'c':
+			str = "pg_catalog.bpchar";
+			break;
+		default:
+			elog(ERROR, "invalid alignment %c", typForm->typalign);
+	}
+
+	/* ALIGNMENT */
+	tmp = new_objtree_VA("ALIGNMENT=%{align}s", 2,
+						 "clause", ObjTypeString, "alignment",
+						 "align", ObjTypeString, str);
+	list = lappend(list, new_object_object(tmp));
+
+	/* STORAGE */
+	tmp = new_objtree_VA("STORAGE=%{storage}s", 2,
+						 "clause", ObjTypeString, "storage",
+						 "storage", ObjTypeString,
+						 get_type_storage(typForm->typstorage));
+	list = lappend(list, new_object_object(tmp));
+
+	/* CATEGORY */
+	tmp = new_objtree_VA("CATEGORY=%{category}s", 2,
+						 "clause", ObjTypeString, "category",
+						 "category", ObjTypeString,
+						 psprintf("%c", typForm->typcategory));
+	list = lappend(list, new_object_object(tmp));
+
+	/* PREFERRED */
+	tmp = new_objtree_VA("PREFERRED=%{preferred}s", 1,
+						 "preferred", ObjTypeString,
+						 typForm->typispreferred ? "TRUE" : "FALSE");
+	if (!typForm->typispreferred)
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* DEFAULT */
+	dflt = SysCacheGetAttr(TYPEOID, typTup,
+						   Anum_pg_type_typdefault,
+						   &isnull);
+	tmp = new_objtree_VA("DEFAULT=", 1,
+						 "clause", ObjTypeString, "default");
+	if (!isnull)
+		append_string_object(tmp, "%{default}s", "default",
+							 TextDatumGetCString(dflt));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* ELEMENT */
+	tmp = new_objtree_VA("ELEMENT=", 1,
+						 "clause", ObjTypeString, "element");
+	if (OidIsValid(typForm->typelem))
+		append_object_object(tmp, "%{elem}T",
+							 new_objtree_for_type(typForm->typelem, -1));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* DELIMITER */
+	tmp = new_objtree_VA("DELIMITER=", 1,
+						 "clause", ObjTypeString, "delimiter");
+	append_string_object(tmp, "%{delim}L", "delim",
+						 psprintf("%c", typForm->typdelim));
+	list = lappend(list, new_object_object(tmp));
+
+	/* COLLATABLE */
+	tmp = new_objtree_VA("COLLATABLE=", 1,
+						 "clause", ObjTypeString, "collatable");
+	if (!OidIsValid(typForm->typcollation))
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	append_array_object(ret, "%{elems:, }s)", list);
+
+	ReleaseSysCache(typTup);
+
+	return ret;
+}
+
+/*
+ * Deparse a CREATE TEXT SEARCH CONFIGURATION statement.
+ *
+ * Verbose syntax
+ * CREATE TEXT SEARCH CONFIGURATION %{identity}D (%{elems:, }s)
+ */
+static ObjTree *
+deparse_DefineStmt_TSConfig(Oid objectId, DefineStmt *define,
+							ObjectAddress copied)
+{
+	HeapTuple	tscTup;
+	HeapTuple	tspTup;
+	ObjTree    *ret;
+	ObjTree    *tmp;
+	Form_pg_ts_config tscForm;
+	Form_pg_ts_parser tspForm;
+	List	   *list = NIL;
+
+	tscTup = SearchSysCache1(TSCONFIGOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(tscTup))
+		elog(ERROR, "cache lookup failed for text search configuration with OID %u",
+			 objectId);
+	tscForm = (Form_pg_ts_config) GETSTRUCT(tscTup);
+
+	tspTup = SearchSysCache1(TSPARSEROID, ObjectIdGetDatum(tscForm->cfgparser));
+	if (!HeapTupleIsValid(tspTup))
+		elog(ERROR, "cache lookup failed for text search parser %u",
+			 tscForm->cfgparser);
+	tspForm = (Form_pg_ts_parser) GETSTRUCT(tspTup);
+
+	/*
+	 * Add the definition clause.  If we have COPY'ed an existing config, add
+	 * a COPY clause; otherwise add a PARSER clause.
+	 */
+	/* COPY */
+	tmp = new_objtree_VA("COPY=", 1,
+						 "clause", ObjTypeString, "copy");
+	if (OidIsValid(copied.objectId))
+		append_object_object(tmp, "%{tsconfig}D",
+							 new_objtree_for_qualname_id(TSConfigRelationId,
+														 copied.objectId));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* PARSER */
+	tmp = new_objtree_VA("PARSER=", 1,
+						 "clause", ObjTypeString, "parser");
+	if (copied.objectId == InvalidOid)
+		append_object_object(tmp, "%{parser}D",
+							 new_objtree_for_qualname(tspForm->prsnamespace,
+													  NameStr(tspForm->prsname)));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	ret = new_objtree_VA("CREATE TEXT SEARCH CONFIGURATION %{identity}D (%{elems:, }s)", 2,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(tscForm->cfgnamespace,
+												  NameStr(tscForm->cfgname)),
+						 "elems", ObjTypeArray, list);
+
+	ReleaseSysCache(tspTup);
+	ReleaseSysCache(tscTup);
+	return ret;
+}
+
+/*
+ * Deparse a CREATE TEXT SEARCH PARSER statement.
+ *
+ * Verbose syntax
+ * CREATE TEXT SEARCH PARSER %{identity}D (%{elems:, }s)
+ */
+static ObjTree *
+deparse_DefineStmt_TSParser(Oid objectId, DefineStmt *define)
+{
+	HeapTuple	tspTup;
+	ObjTree    *ret;
+	ObjTree    *tmp;
+	List	   *list = NIL;
+	Form_pg_ts_parser tspForm;
+
+	tspTup = SearchSysCache1(TSPARSEROID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(tspTup))
+		elog(ERROR, "cache lookup failed for text search parser with OID %u",
+			 objectId);
+	tspForm = (Form_pg_ts_parser) GETSTRUCT(tspTup);
+
+	/* Add the definition clause */
+	/* START */
+	tmp = new_objtree_VA("START=%{procedure}D", 2,
+						 "clause", ObjTypeString, "start",
+						 "procedure", ObjTypeObject,
+						 new_objtree_for_qualname_id(ProcedureRelationId,
+													 tspForm->prsstart));
+	list = lappend(list, new_object_object(tmp));
+
+	/* GETTOKEN */
+	tmp = new_objtree_VA("GETTOKEN=%{procedure}D", 2,
+						 "clause", ObjTypeString, "gettoken",
+						 "procedure", ObjTypeObject,
+						 new_objtree_for_qualname_id(ProcedureRelationId,
+													 tspForm->prstoken));
+	list = lappend(list, new_object_object(tmp));
+
+	/* END */
+	tmp = new_objtree_VA("END=%{procedure}D", 2,
+						 "clause", ObjTypeString, "end",
+						 "procedure", ObjTypeObject,
+						 new_objtree_for_qualname_id(ProcedureRelationId,
+													 tspForm->prsend));
+	list = lappend(list, new_object_object(tmp));
+
+	/* LEXTYPES */
+	tmp = new_objtree_VA("LEXTYPES=%{procedure}D", 2,
+						 "clause", ObjTypeString, "lextypes",
+						 "procedure", ObjTypeObject,
+						 new_objtree_for_qualname_id(ProcedureRelationId,
+													 tspForm->prslextype));
+	list = lappend(list, new_object_object(tmp));
+
+	/* HEADLINE */
+	tmp = new_objtree_VA("HEADLINE=", 1,
+						 "clause", ObjTypeString, "headline");
+	if (OidIsValid(tspForm->prsheadline))
+		append_object_object(tmp, "%{procedure}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 tspForm->prsheadline));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	ret = new_objtree_VA("CREATE TEXT SEARCH PARSER %{identity}D (%{elems:, }s)", 2,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(tspForm->prsnamespace,
+												  NameStr(tspForm->prsname)),
+						 "elems", ObjTypeArray, list);
+
+	ReleaseSysCache(tspTup);
+	return ret;
+}
+
+/*
+ * Deparse a CREATE TEXT SEARCH DICTIONARY statement.
+ *
+ * Verbose syntax
+ * CREATE TEXT SEARCH DICTIONARY %{identity}D (%{elems:, }s)
+ */
+static ObjTree *
+deparse_DefineStmt_TSDictionary(Oid objectId, DefineStmt *define)
+{
+	HeapTuple	tsdTup;
+	ObjTree    *ret;
+	ObjTree    *tmp;
+	List	   *list = NIL;
+	Datum		options;
+	bool		isnull;
+	Form_pg_ts_dict tsdForm;
+
+	tsdTup = SearchSysCache1(TSDICTOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(tsdTup))
+		elog(ERROR, "cache lookup failed for text search dictionary with OID %u",
+			 objectId);
+	tsdForm = (Form_pg_ts_dict) GETSTRUCT(tsdTup);
+
+
+
+	/* Add the definition clause */
+	/* TEMPLATE */
+	tmp = new_objtree_VA("TEMPLATE=", 1,
+						 "clause", ObjTypeString, "template");
+	append_object_object(tmp, "%{template}D",
+						 new_objtree_for_qualname_id(TSTemplateRelationId,
+													 tsdForm->dicttemplate));
+	list = lappend(list, new_object_object(tmp));
+
+	/*
+	 * options.  XXX this is a pretty useless representation, but we can't do
+	 * better without more ts_cache.c cooperation ...
+	 */
+	options = SysCacheGetAttr(TSDICTOID, tsdTup,
+							  Anum_pg_ts_dict_dictinitoption,
+							  &isnull);
+	tmp = new_objtree("");
+	if (!isnull)
+		append_string_object(tmp, "%{options}s", "options",
+							 TextDatumGetCString(options));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	ret = new_objtree_VA("CREATE TEXT SEARCH DICTIONARY %{identity}D (%{elems:, }s)", 2,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(tsdForm->dictnamespace,
+												  NameStr(tsdForm->dictname)),
+						 "elems", ObjTypeArray, list);
+
+	ReleaseSysCache(tsdTup);
+	return ret;
+}
+
+/*
+ * Deparse a CREATE TEXT SEARCH TEMPLATE statement.
+ *
+ * Verbose syntax
+ * CREATE TEXT SEARCH TEMPLATE %{identity}D (%{elems:, }s)
+ */
+static ObjTree *
+deparse_DefineStmt_TSTemplate(Oid objectId, DefineStmt *define)
+{
+	HeapTuple	tstTup;
+	ObjTree    *ret;
+	ObjTree    *tmp;
+	List	   *list = NIL;
+	Form_pg_ts_template tstForm;
+
+	tstTup = SearchSysCache1(TSTEMPLATEOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(tstTup))
+		elog(ERROR, "cache lookup failed for text search template with OID %u",
+			 objectId);
+	tstForm = (Form_pg_ts_template) GETSTRUCT(tstTup);
+
+	/* Add the definition clause */
+	/* INIT */
+	tmp = new_objtree_VA("INIT=", 1,
+						 "clause", ObjTypeString, "init");
+	if (OidIsValid(tstForm->tmplinit))
+		append_object_object(tmp, "%{procedure}D",
+							 new_objtree_for_qualname_id(ProcedureRelationId,
+														 tstForm->tmplinit));
+	else
+		append_not_present(tmp);
+	list = lappend(list, new_object_object(tmp));
+
+	/* LEXIZE */
+	tmp = new_objtree_VA("LEXIZE=%{procedure}D", 2,
+						 "clause", ObjTypeString, "lexize",
+						 "procedure", ObjTypeObject,
+						 new_objtree_for_qualname_id(ProcedureRelationId,
+													 tstForm->tmpllexize));
+	list = lappend(list, new_object_object(tmp));
+
+	ret = new_objtree_VA("CREATE TEXT SEARCH TEMPLATE %{identity}D (%{elems:, }s)", 2,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(tstForm->tmplnamespace,
+												  NameStr(tstForm->tmplname)),
+						 "elems", ObjTypeArray, list);
+
+	ReleaseSysCache(tstTup);
+	return ret;
+}
+
+/*
+ * Deparse an ALTER TEXT SEARCH CONFIGURATION statement.
+ *
+ * Verbose syntax
+ * ALTER TEXT SEARCH CONFIGURATION %{identity}D ADD MAPPING
+ * FOR %{tokentype:, }I WITH %{dictionaries:, }D
+ *	OR
+ * ALTER TEXT SEARCH CONFIGURATION %{identity}D DROP MAPPING %{if_exists}s
+ * FOR %{tokentype}I
+ *	OR
+ * ALTER TEXT SEARCH CONFIGURATION %{identity}D ALTER MAPPING
+ * FOR %{tokentype:, }I WITH %{dictionaries:, }D
+ *	OR
+ * ALTER TEXT SEARCH CONFIGURATION %{identity}D ALTER MAPPING
+ * REPLACE %{old_dictionary}D WITH %{new_dictionary}D
+ *	OR
+ * ALTER TEXT SEARCH CONFIGURATION %{identity}D ALTER MAPPING
+ * FOR %{tokentype:, }I REPLACE %{old_dictionary}D WITH %{new_dictionary}D
+ */
+static ObjTree *
+deparse_AlterTSConfigurationStmt(CollectedCommand *cmd)
+{
+	AlterTSConfigurationStmt *node = (AlterTSConfigurationStmt *) cmd->parsetree;
+	ObjTree    *ret;
+	ObjTree    *tmp;
+	List	   *list = NIL;
+	ListCell   *cell;
+	int			i;
+
+	ret = new_objtree("ALTER TEXT SEARCH CONFIGURATION");
+
+	/* Determine the format string appropriate to each subcommand */
+	switch (node->kind)
+	{
+		case ALTER_TSCONFIG_ADD_MAPPING:
+			append_object_object(ret, "%{identity}D ADD MAPPING",
+								 new_objtree_for_qualname_id(cmd->d.atscfg.address.classId,
+															 cmd->d.atscfg.address.objectId));
+			break;
+
+		case ALTER_TSCONFIG_DROP_MAPPING:
+			append_object_object(ret, "%{identity}D DROP MAPPING",
+								 new_objtree_for_qualname_id(cmd->d.atscfg.address.classId,
+															 cmd->d.atscfg.address.objectId));
+			tmp = new_objtree("IF EXISTS");
+			append_bool_object(tmp, "present", node->missing_ok);
+			append_object_object(ret, "%{if_exists}s", tmp);
+			break;
+
+		case ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN:
+		case ALTER_TSCONFIG_REPLACE_DICT:
+		case ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN:
+			append_object_object(ret, "%{identity}D ALTER MAPPING",
+								 new_objtree_for_qualname_id(cmd->d.atscfg.address.classId,
+															 cmd->d.atscfg.address.objectId));
+			break;
+	}
+
+	/* Add the affected token list, for subcommands that have one */
+	if (node->kind == ALTER_TSCONFIG_ADD_MAPPING ||
+		node->kind == ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN ||
+		node->kind == ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN ||
+		node->kind == ALTER_TSCONFIG_DROP_MAPPING)
+	{
+		foreach(cell, node->tokentype)
+			list = lappend(list, new_string_object(strVal(lfirst(cell))));
+		append_array_object(ret, "FOR %{tokentype:, }I", list);
+	}
+
+	/* Add further subcommand-specific elements */
+	if (node->kind == ALTER_TSCONFIG_ADD_MAPPING ||
+		node->kind == ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN)
+	{
+		/* ADD MAPPING and ALTER MAPPING FOR need a list of dictionaries */
+		list = NIL;
+		for (i = 0; i < cmd->d.atscfg.ndicts; i++)
+		{
+			ObjTree    *dict_obj;
+
+			dict_obj = new_objtree_for_qualname_id(TSDictionaryRelationId,
+												  cmd->d.atscfg.dictIds[i]);
+			list = lappend(list,
+						   new_object_object(dict_obj));
+		}
+		append_array_object(ret, "WITH %{dictionaries:, }D", list);
+	}
+	else if (node->kind == ALTER_TSCONFIG_REPLACE_DICT ||
+			 node->kind == ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN)
+	{
+		/* The REPLACE forms want old and new dictionaries */
+		Assert(cmd->d.atscfg.ndicts == 2);
+		append_object_object(ret, "REPLACE %{old_dictionary}D",
+							 new_objtree_for_qualname_id(TSDictionaryRelationId,
+														 cmd->d.atscfg.dictIds[0]));
+		append_object_object(ret, "WITH %{new_dictionary}D",
+							 new_objtree_for_qualname_id(TSDictionaryRelationId,
+														 cmd->d.atscfg.dictIds[1]));
+	}
+
+	return ret;
+}
+
+/*
+ * Deparse an ALTER TEXT SEARCH DICTIONARY statement.
+ *
+ * Verbose syntax
+ * ALTER TEXT SEARCH DICTIONARY %{identity}D (%{definition:, }s)
+ */
+static ObjTree *
+deparse_AlterTSDictionaryStmt(Oid objectId, Node *parsetree)
+{
+	ObjTree    *ret;
+	ObjTree    *tmp;
+	Datum		options;
+	List	   *definition = NIL;
+	bool		isnull;
+	HeapTuple	tsdTup;
+	Form_pg_ts_dict tsdForm;
+
+	tsdTup = SearchSysCache1(TSDICTOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(tsdTup))
+		elog(ERROR, "cache lookup failed for text search dictionary with OID %u",
+			 objectId);
+	tsdForm = (Form_pg_ts_dict) GETSTRUCT(tsdTup);
+
+	/*
+	 * Add the definition list according to the pg_ts_dict dictinitoption
+	 * column
+	 */
+	options = SysCacheGetAttr(TSDICTOID, tsdTup,
+							  Anum_pg_ts_dict_dictinitoption,
+							  &isnull);
+	tmp = new_objtree("");
+	if (!isnull)
+		append_string_object(tmp, "%{options}s", "options",
+							 TextDatumGetCString(options));
+	else
+		append_not_present(tmp);
+
+	definition = lappend(definition, new_object_object(tmp));
+
+	ret = new_objtree_VA("ALTER TEXT SEARCH DICTIONARY %{identity}D (%{definition:, }s)", 2,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(tsdForm->dictnamespace,
+												  NameStr(tsdForm->dictname)),
+						 "definition", ObjTypeArray, definition);
+
+	ReleaseSysCache(tsdTup);
+	return ret;
+}
+
+/*
+ * deparse_ViewStmt
+ *		deparse a ViewStmt
+ *
+ * Given a view OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE %{or_replace}s %{persistence}s VIEW %{identity}D AS %{query}s
+ */
+static ObjTree *
+deparse_ViewStmt(Oid objectId, Node *parsetree)
+{
+	ViewStmt   *node = (ViewStmt *) parsetree;
+	ObjTree    *ret;
+	Relation	relation;
+
+	relation = relation_open(objectId, AccessShareLock);
+
+	ret = new_objtree_VA("CREATE %{or_replace}s %{persistence}s VIEW %{identity}D AS %{query}s", 4,
+						 "or_replace", ObjTypeString,
+						 node->replace ? "OR REPLACE" : "",
+						 "persistence", ObjTypeString,
+						 get_persistence_str(relation->rd_rel->relpersistence),
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(relation->rd_rel->relnamespace,
+												  RelationGetRelationName(relation)),
+						 "query", ObjTypeString,
+						 pg_get_viewdef_string(objectId));
+
+	relation_close(relation, AccessShareLock);
+	return ret;
+}
+
+/*
+ * Deparse CREATE Materialized View statement, it is a variant of
+ * CreateTableAsStmt
+ *
+ * Note that CREATE TABLE AS SELECT INTO can also be deparsed by
+ * deparse_CreateTableAsStmt to remove the SELECT INTO clause.
+ *
+ * Verbose syntax
+ * CREATE %{persistence}s [MATERIALIZED VIEW | TABLE] %{if_not_exists}s
+ * 		%{identity}D %{columns}s [%{on_commit}s] %{tablespace}s
+ *  		AS %{query}s %{with_no_data}s"
+ */
+static ObjTree *
+deparse_CreateTableAsStmt_vanilla(Oid objectId, Node *parsetree)
+{
+	CreateTableAsStmt *node = (CreateTableAsStmt *) parsetree;
+	Relation	relation = relation_open(objectId, AccessShareLock);
+	ObjTree    *ret;
+	ObjTree    *tmp;
+	ObjTree    *tmp2;
+	char	   *fmt;
+	List	   *list = NIL;
+	ListCell   *cell;
+
+	/* Reject unsupported case right away. */
+	if (((Query *) (node->query))->commandType == CMD_UTILITY)
+		elog(ERROR, "unimplemented deparse of CREATE TABLE AS EXECUTE");
+
+	/*
+	 * Note that INSERT INTO is deparsed as CREATE TABLE AS.  They are
+	 * functionally equivalent synonyms so there is no harm from this.
+	 */
+	if (node->objtype == OBJECT_MATVIEW)
+		fmt = "CREATE %{persistence}s MATERIALIZED VIEW %{if_not_exists}s %{identity}D";
+	else
+		fmt = "CREATE %{persistence}s TABLE %{if_not_exists}s %{identity}D";
+
+	ret = new_objtree_VA(fmt, 3,
+						 "persistence", ObjTypeString,
+						 get_persistence_str(node->into->rel->relpersistence),
+						 "if_not_exists", ObjTypeString,
+						 node->if_not_exists ? "IF NOT EXISTS" : "",
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname_id(RelationRelationId,
+													 objectId));
+
+	/* COLUMNS clause */
+	if (node->into->colNames)
+	{
+		foreach(cell, node->into->colNames)
+			list = lappend(list, new_string_object(strVal(lfirst(cell))));
+
+		tmp = new_objtree_VA("(%{columns:, }I)", 1,
+							 "columns", ObjTypeArray, list);
+	}
+	else
+		tmp = new_objtree_VA("", 1,
+							 "present", ObjTypeBool, false);
+
+	append_object_object(ret, "%{columns}s", tmp);
+
+	/* USING clause */
+	tmp = new_objtree("USING");
+	if (node->into->accessMethod)
+		append_string_object(tmp, "%{access_method}I", "access_method",
+							 node->into->accessMethod);
+	else
+	{
+		append_null_object(tmp, "%{access_method}I");
+		append_not_present(tmp);
+	}
+	append_object_object(ret, "%{access_method}s", tmp);
+
+	/* WITH clause */
+	tmp = new_objtree("WITH");
+	list = NIL;
+
+	foreach(cell, node->into->options)
+	{
+		DefElem    *opt = (DefElem *) lfirst(cell);
+
+		tmp2 = deparse_DefElem(opt, false);
+		list = lappend(list, new_object_object(tmp2));
+	}
+
+	if (list)
+		append_array_object(tmp, "(%{with:, }s)", list);
+	else
+		append_not_present(tmp);
+
+	append_object_object(ret, "%{with_clause}s", tmp);
+
+	/* ON COMMIT clause.  CREATE MATERIALIZED VIEW doesn't have one */
+	if (node->objtype == OBJECT_TABLE)
+		append_object_object(ret, "%{on_commit}s",
+							 deparse_OnCommitClause(node->into->onCommit));
+
+	/* TABLESPACE clause */
+	tmp = new_objtree("TABLESPACE %{tablespace}I");
+	if (node->into->tableSpaceName)
+		append_string_object(tmp, "%{tablespace}s", "tablespace",
+							 node->into->tableSpaceName);
+	else
+	{
+		append_null_object(tmp, "%{tablespace}I");
+		append_not_present(tmp);
+	}
+	append_object_object(ret, "%{tablespace}s", tmp);
+
+	/* Add the query */
+	Assert(IsA(node->query, Query));
+	append_string_object(ret, "AS %{query}s", "query",
+						 pg_get_querydef((Query *) node->query, false));
+
+	/* Add a WITH NO DATA clause */
+	tmp = new_objtree_VA("WITH NO DATA", 1,
+						 "present", ObjTypeBool,
+						 node->into->skipData ? true : false);
+	append_object_object(ret, "%{with_no_data}s", tmp);
+
+	relation_close(relation, AccessShareLock);
+
+	return ret;
+}
+
+/*
+ * Deparse a CreateTrigStmt (CREATE TRIGGER)
+ *
+ * Given a trigger OID and the parse tree that created it, return an ObjTree
+ * representing the creation command.
+ *
+ * Verbose syntax
+ * CREATE %{constraint}s TRIGGER %{name}I %{time}s %{events: OR }s ON
+ * %{relation}D %{from_table}s %{constraint_attrs: }s %{referencing: }s
+ * FOR EACH %{for_each}s %{when}s EXECUTE PROCEDURE %{function}s
+ */
+static ObjTree *
+deparse_CreateTrigStmt(Oid objectId, Node *parsetree)
+{
+	CreateTrigStmt *node = (CreateTrigStmt *) parsetree;
+	Relation	pg_trigger;
+	HeapTuple	trigTup;
+	Form_pg_trigger trigForm;
+	ObjTree    *ret;
+	ObjTree    *tmp_obj;
+	int			tgnargs;
+	List	   *list = NIL;
+	List	   *events;
+	char	   *trigtiming;
+	char	   *tgoldtable;
+	char	   *tgnewtable;
+	Datum		value;
+	bool		isnull;
+
+	pg_trigger = table_open(TriggerRelationId, AccessShareLock);
+
+	trigTup = get_catalog_object_by_oid(pg_trigger, Anum_pg_trigger_oid, objectId);
+	trigForm = (Form_pg_trigger) GETSTRUCT(trigTup);
+
+	trigtiming = node->timing == TRIGGER_TYPE_BEFORE ? "BEFORE" :
+		node->timing == TRIGGER_TYPE_AFTER ? "AFTER" :
+		node->timing == TRIGGER_TYPE_INSTEAD ? "INSTEAD OF" :
+		NULL;
+	if (!trigtiming)
+		elog(ERROR, "unrecognized trigger timing type %d", node->timing);
+
+	ret = new_objtree_VA("CREATE %{constraint}s TRIGGER %{name}I %{time}s", 3,
+						 "constraint", ObjTypeString, node->isconstraint ? "CONSTRAINT" : "",
+						 "name", ObjTypeString, node->trigname,
+						 "time", ObjTypeString, trigtiming);
+
+	/*
+	 * Decode the events that the trigger fires for.  The output is a list; in
+	 * most cases it will just be a string with the event name, but when
+	 * there's an UPDATE with a list of columns, we return a JSON object.
+	 */
+	events = NIL;
+	if (node->events & TRIGGER_TYPE_INSERT)
+		events = lappend(events, new_string_object("INSERT"));
+	if (node->events & TRIGGER_TYPE_DELETE)
+		events = lappend(events, new_string_object("DELETE"));
+	if (node->events & TRIGGER_TYPE_TRUNCATE)
+		events = lappend(events, new_string_object("TRUNCATE"));
+	if (node->events & TRIGGER_TYPE_UPDATE)
+	{
+		if (node->columns == NIL)
+		{
+			events = lappend(events, new_string_object("UPDATE"));
+		}
+		else
+		{
+			ObjTree    *update;
+			ListCell   *cell;
+			List	   *cols = NIL;
+
+			/*
+			 * Currently only UPDATE OF can be objects in the output JSON, but
+			 * we add a "kind" element so that user code can distinguish
+			 * possible future new event types.
+			 */
+			update = new_objtree_VA("UPDATE OF", 1,
+									"kind", ObjTypeString, "update_of");
+
+			foreach(cell, node->columns)
+			{
+				char	   *colname = strVal(lfirst(cell));
+
+				cols = lappend(cols, new_string_object(colname));
+			}
+
+			append_array_object(update, "%{columns:, }I", cols);
+
+			events = lappend(events, new_object_object(update));
+		}
+	}
+	append_array_object(ret, "%{events: OR }s", events);
+
+	tmp_obj = new_objtree_for_qualname_id(RelationRelationId,
+										 trigForm->tgrelid);
+	append_object_object(ret, "ON %{relation}D", tmp_obj);
+
+	tmp_obj = new_objtree("FROM");
+	if (trigForm->tgconstrrelid)
+	{
+		ObjTree    *rel;
+
+		rel = new_objtree_for_qualname_id(RelationRelationId,
+										  trigForm->tgconstrrelid);
+		append_object_object(tmp_obj, "%{relation}D", rel);
+	}
+	else
+		append_not_present(tmp_obj);
+	append_object_object(ret, "%{from_table}s", tmp_obj);
+
+	if (node->isconstraint)
+	{
+		if (!node->deferrable)
+			list = lappend(list, new_string_object("NOT"));
+		list = lappend(list, new_string_object("DEFERRABLE INITIALLY"));
+		if (node->initdeferred)
+			list = lappend(list, new_string_object("DEFERRED"));
+		else
+			list = lappend(list, new_string_object("IMMEDIATE"));
+	}
+	append_array_object(ret, "%{constraint_attrs: }s", list);
+
+	list = NIL;
+	value = fastgetattr(trigTup, Anum_pg_trigger_tgoldtable,
+						RelationGetDescr(pg_trigger), &isnull);
+	if (!isnull)
+		tgoldtable = NameStr(*DatumGetName(value));
+	else
+		tgoldtable = NULL;
+	value = fastgetattr(trigTup, Anum_pg_trigger_tgnewtable,
+						RelationGetDescr(pg_trigger), &isnull);
+	if (!isnull)
+		tgnewtable = NameStr(*DatumGetName(value));
+	else
+		tgnewtable = NULL;
+	if (tgoldtable != NULL || tgnewtable != NULL)
+	{
+		list = lappend(list, new_string_object("REFERENCING"));
+
+		if (tgoldtable != NULL)
+		{
+			list = lappend(list, new_string_object("OLD TABLE AS"));
+			list = lappend(list, new_string_object(tgoldtable));
+		}
+		if (tgnewtable != NULL)
+		{
+			list = lappend(list, new_string_object("NEW TABLE AS"));
+			list = lappend(list, new_string_object(tgnewtable));
+		}
+	}
+	append_array_object(ret, "%{referencing: }s", list);
+
+	append_string_object(ret, "FOR EACH %{for_each}s", "for_each",
+						 node->row ? "ROW" : "STATEMENT");
+
+	tmp_obj = new_objtree("WHEN");
+	if (node->whenClause)
+	{
+		Node	   *whenClause;
+
+		value = fastgetattr(trigTup, Anum_pg_trigger_tgqual,
+							RelationGetDescr(pg_trigger), &isnull);
+		if (isnull)
+			elog(ERROR, "null tgqual for trigger \"%s\"",
+				 NameStr(trigForm->tgname));
+
+		whenClause = stringToNode(TextDatumGetCString(value));
+		append_string_object(tmp_obj, "(%{clause}s)", "clause",
+							 pg_get_trigger_whenclause(trigForm,
+													   whenClause,
+													   false));
+	}
+	else
+		append_not_present(tmp_obj);
+	append_object_object(ret, "%{when}s", tmp_obj);
+
+	tmp_obj = new_objtree_VA("%{funcname}D", 1,
+							"funcname", ObjTypeObject,
+							new_objtree_for_qualname_id(ProcedureRelationId,
+														trigForm->tgfoid));
+	list = NIL;
+	tgnargs = trigForm->tgnargs;
+	if (tgnargs > 0)
+	{
+		char	   *p;
+		int			i;
+
+		value = fastgetattr(trigTup, Anum_pg_trigger_tgargs,
+							RelationGetDescr(pg_trigger), &isnull);
+		if (isnull)
+			elog(ERROR, "null tgargs for trigger \"%s\"",
+				 NameStr(trigForm->tgname));
+		p = (char *) VARDATA_ANY(DatumGetByteaPP(value));
+		for (i = 0; i < tgnargs; i++)
+		{
+			list = lappend(list, new_string_object(p));
+			/* advance p to next string embedded in tgargs */
+			while (*p)
+				p++;
+			p++;
+		}
+	}
+
+	append_format_string(tmp_obj, "(");
+	append_array_object(tmp_obj, "%{args:, }L", list);	/* might be NIL */
+	append_format_string(tmp_obj, ")");
+
+	append_object_object(ret, "EXECUTE FUNCTION %{function}s", tmp_obj);
+
+	table_close(pg_trigger, AccessShareLock);
+
+	return ret;
+}
+
+/*
+ * Deparse a CreateUserMappingStmt (CREATE USER MAPPING)
+ *
+ * Given a User Mapping OID and the parse tree that created it,
+ * return an ObjTree representing the CREATE USER MAPPING command.
+ *
+ * Verbose syntax
+ * CREATE USER MAPPING FOR %{role}R SERVER %{server}I
+ */
+static ObjTree *
+deparse_CreateUserMappingStmt(Oid objectId, Node *parsetree)
+{
+	CreateUserMappingStmt *node = (CreateUserMappingStmt *) parsetree;
+	ObjTree    *ret;
+	Relation	rel;
+	HeapTuple	tp;
+	Form_pg_user_mapping form;
+	ForeignServer *server;
+
+	rel = table_open(UserMappingRelationId, RowExclusiveLock);
+
+	/*
+	 * Lookup object in the catalog, so we don't have to deal with
+	 * current_user and such.
+	 */
+	tp = SearchSysCache1(USERMAPPINGOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(tp))
+		elog(ERROR, "cache lookup failed for user mapping with OID %u",
+			 objectId);
+
+	form = (Form_pg_user_mapping) GETSTRUCT(tp);
+
+	server = GetForeignServer(form->umserver);
+
+	ret = new_objtree_VA("CREATE USER MAPPING FOR %{role}R SERVER %{server}I %{generic_options}s", 3,
+						 "role", ObjTypeObject,
+						 new_objtree_for_role_id(form->umuser),
+						 "server", ObjTypeString, server->servername,
+						 "generic_options", ObjTypeObject,
+						 deparse_FdwOptions(node->options, NULL, false));
+
+	ReleaseSysCache(tp);
+	table_close(rel, RowExclusiveLock);
+	return ret;
+}
+
+/*
+ * deparse_AlterUserMapping
+ *
+ * Given a User Mapping OID and the parse tree that created it, return an
+ * ObjTree representing the alter command.
+ *
+ * Verbose syntax
+ * ALTER USER MAPPING FOR %{role}R SERVER %{server}I
+ */
+static ObjTree *
+deparse_AlterUserMappingStmt(Oid objectId, Node *parsetree)
+{
+	AlterUserMappingStmt *node = (AlterUserMappingStmt *) parsetree;
+	ObjTree    *ret;
+	Relation	rel;
+	HeapTuple	tp;
+	Form_pg_user_mapping form;
+	ForeignServer *server;
+
+	rel = table_open(UserMappingRelationId, RowExclusiveLock);
+
+	/*
+	 * Lookup object in the catalog, so we don't have to deal with
+	 * current_user and such.
+	 */
+	tp = SearchSysCache1(USERMAPPINGOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(tp))
+		elog(ERROR, "cache lookup failed for user mapping with OID %u",
+			 objectId);
+
+	form = (Form_pg_user_mapping) GETSTRUCT(tp);
+
+	server = GetForeignServer(form->umserver);
+
+	ret = new_objtree_VA("ALTER USER MAPPING FOR %{role}R SERVER %{server}I %{generic_options}s", 3,
+						 "role", ObjTypeObject,
+						 new_objtree_for_role_id(form->umuser),
+						 "server", ObjTypeString, server->servername,
+						 "generic_options", ObjTypeObject,
+						 deparse_FdwOptions(node->options, NULL, false));
+
+	ReleaseSysCache(tp);
+	table_close(rel, RowExclusiveLock);
+	return ret;
+}
+
+/*
+ * Deparse an AlterStatsStmt (ALTER STATISTICS)
+ *
+ * Given a alter statistics OID and the parse tree that created it, return an
+ * ObjTree representing the alter command.
+ *
+ * Verbose syntax
+ * ALTER STATISTICS %{identity}D SET STATISTICS %{target}n
+ */
+static ObjTree *
+deparse_AlterStatsStmt(Oid objectId, Node *parsetree)
+{
+	AlterStatsStmt *node = (AlterStatsStmt *) parsetree;
+	ObjTree    *ret;
+	HeapTuple	tp;
+	Form_pg_statistic_ext statform;
+
+	if (!node->stxstattarget)
+		return NULL;
+
+	/* Lookup object in the catalog */
+	tp = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(tp))
+		elog(ERROR, "cache lookup failed for statistic with OID %u", objectId);
+
+	statform = (Form_pg_statistic_ext) GETSTRUCT(tp);
+	ret = new_objtree_VA("ALTER STATISTICS %{identity}D SET STATISTICS %{target}n", 2,
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname(statform->stxnamespace,
+												  NameStr(statform->stxname)),
+						 "target", ObjTypeInteger, node->stxstattarget);
+
+	ReleaseSysCache(tp);
+	return ret;
+}
+
+/*
+ * Deparse a RefreshMatViewStmt (REFRESH MATERIALIZED VIEW)
+ *
+ * Given a materialized view OID and the parse tree that created it, return an
+ * ObjTree representing the refresh command.
+ *
+ * Verbose syntax
+ * REFRESH MATERIALIZED VIEW %{concurrently}s %{identity}D %{with_no_data}s
+ */
+static ObjTree *
+deparse_RefreshMatViewStmt(Oid objectId, Node *parsetree)
+{
+	RefreshMatViewStmt *node = (RefreshMatViewStmt *) parsetree;
+	ObjTree    *ret;
+	ObjTree    *tmp;
+
+	ret = new_objtree_VA("REFRESH MATERIALIZED VIEW %{concurrently}s %{identity}D", 2,
+						 "concurrently", ObjTypeString,
+						 node->concurrent ? "CONCURRENTLY" : "",
+						 "identity", ObjTypeObject,
+						 new_objtree_for_qualname_id(RelationRelationId,
+													 objectId));
+
+	/* Add a WITH NO DATA clause */
+	tmp = new_objtree_VA("WITH NO DATA", 1,
+						 "present", ObjTypeBool,
+						 node->skipData ? true : false);
+	append_object_object(ret, "%{with_no_data}s", tmp);
+
+	return ret;
+}
+
+/*
+ * Deparse a RenameStmt.
+ *
+ * Verbose syntax
+ * ALTER %s %{if_exists}s %{identity}D RENAME TO %{newname}I
+ * OR
+ * ALTER POLICY %{if_exists}s %{policyname}I ON %{identity}D RENAME TO %{newname}I
+ * OR
+ * ALTER DOMAIN %{identity}D RENAME CONSTRAINT %{oldname}I TO %{newname}I
+ * OR
+ * ALTER TABLE %{identity}D RENAME CONSTRAINT %{oldname}I TO %{newname}I
+ * OR
+ * ALTER objtype %{identity}D RENAME ATTRIBUTE %{colname}I TO %{newname}I %{cascade}s
+ * OR
+ * ALTER objtype %{if_exists}s %%{identity}D RENAME COLUMN %{colname}I TO %{newname}I
+ * OR
+ * ALTER %s %%{identity}s RENAME TO %%{newname}I
+ * OR
+ * ALTER %s %%{identity}D USING %%{index_method}s RENAME TO %%{newname}I
+ * OR
+ * ALTER SCHEMA %{identity}I RENAME TO %{newname}I
+ * OR
+ * ALTER RULE %{rulename}I ON %{identity}D RENAME TO %{newname}I
+ * OR
+ * ALTER TRIGGER %{triggername}I ON %{identity}D RENAME TO %{newname}I
+ * OR
+ * ALTER %s %%{identity}D RENAME TO %%{newname}I
+ */
+static ObjTree *
+deparse_RenameStmt(ObjectAddress address, Node *parsetree)
+{
+	RenameStmt *node = (RenameStmt *) parsetree;
+	ObjTree    *ret;
+	Relation	relation;
+	Oid			schemaId;
+
+	/*
+	 * In an ALTER .. RENAME command, we don't have the original name of the
+	 * object in system catalogs: since we inspect them after the command has
+	 * executed, the old name is already gone.  Therefore, we extract it from
+	 * the parse node.  Note we still extract the schema name from the catalog
+	 * (it might not be present in the parse node); it cannot possibly have
+	 * changed anyway.
+	 */
+	switch (node->renameType)
+	{
+		case OBJECT_TABLE:
+		case OBJECT_INDEX:
+		case OBJECT_SEQUENCE:
+		case OBJECT_VIEW:
+		case OBJECT_MATVIEW:
+		case OBJECT_FOREIGN_TABLE:
+			relation = relation_open(address.objectId, AccessShareLock);
+			schemaId = RelationGetNamespace(relation);
+			ret = new_objtree_VA("ALTER %{objtype}s %{if_exists}s %{identity}D RENAME TO %{newname}I", 4,
+								 "objtype", ObjTypeString,
+								 stringify_objtype(node->renameType, false),
+								 "if_exists", ObjTypeString,
+								 node->missing_ok ? "IF EXISTS" : "",
+								 "identity", ObjTypeObject,
+								 new_objtree_for_qualname(schemaId,
+														  node->relation->relname),
+								 "newname", ObjTypeString,
+								 node->newname);
+			relation_close(relation, AccessShareLock);
+			break;
+
+		case OBJECT_POLICY:
+			{
+				HeapTuple	polTup;
+				Form_pg_policy polForm;
+				Relation	pg_policy;
+				ScanKeyData key;
+				SysScanDesc scan;
+
+				pg_policy = relation_open(PolicyRelationId, AccessShareLock);
+				ScanKeyInit(&key, Anum_pg_policy_oid,
+							BTEqualStrategyNumber, F_OIDEQ,
+							ObjectIdGetDatum(address.objectId));
+				scan = systable_beginscan(pg_policy, PolicyOidIndexId, true,
+										  NULL, 1, &key);
+				polTup = systable_getnext(scan);
+				if (!HeapTupleIsValid(polTup))
+					elog(ERROR, "cache lookup failed for policy with OID %u",
+						 address.objectId);
+				polForm = (Form_pg_policy) GETSTRUCT(polTup);
+
+				ret = new_objtree_VA("ALTER POLICY %{if_exists}s %{policyname}I ON %{identity}D RENAME TO %{newname}I", 4,
+									 "if_exists", ObjTypeString,
+									 node->missing_ok ? "IF EXISTS" : "",
+									 "policyname", ObjTypeString,
+									 node->subname,
+									 "identity", ObjTypeObject,
+									 new_objtree_for_qualname_id(RelationRelationId,
+																 polForm->polrelid),
+									 "newname", ObjTypeString,
+									 node->newname);
+				systable_endscan(scan);
+				relation_close(pg_policy, AccessShareLock);
+			}
+			break;
+
+		case OBJECT_DOMCONSTRAINT:
+			{
+				HeapTuple	domtup;
+				HeapTuple	consttup;
+				Form_pg_constraint constform;
+				Form_pg_type domform;
+
+				/* Get domain id from the constraint */
+				consttup = SearchSysCache1(CONSTROID,
+										   ObjectIdGetDatum(address.objectId));
+				if (!HeapTupleIsValid(consttup))
+					elog(ERROR, "cache lookup failed for constraint with OID %u",
+						 address.objectId);
+				constform = (Form_pg_constraint) GETSTRUCT(consttup);
+
+				domtup = SearchSysCache1(TYPEOID,
+										 ObjectIdGetDatum(constform->contypid));
+				if (!HeapTupleIsValid(domtup))
+					elog(ERROR, "cache lookup failed for domain with OID %u",
+						 constform->contypid);
+				ReleaseSysCache(consttup);
+
+				domform = (Form_pg_type) GETSTRUCT(domtup);
+				ret = new_objtree_VA("ALTER DOMAIN %{identity}D RENAME CONSTRAINT %{oldname}I TO %{newname}I", 3,
+						"identity", ObjTypeObject,
+						new_objtree_for_qualname(domform->typnamespace,
+												 NameStr(domform->typname)),
+						"oldname", ObjTypeString, node->subname,
+						"newname", ObjTypeString, node->newname);
+				ReleaseSysCache(domtup);
+			}
+			break;
+
+		case OBJECT_TABCONSTRAINT:
+			{
+				HeapTuple	constrtup;
+				Form_pg_constraint constform;
+
+				constrtup = SearchSysCache1(CONSTROID,
+											ObjectIdGetDatum(address.objectId));
+				if (!HeapTupleIsValid(constrtup))
+					elog(ERROR, "cache lookup failed for constraint with OID %u",
+						 address.objectId);
+				constform = (Form_pg_constraint) GETSTRUCT(constrtup);
+
+				ret = new_objtree_VA("ALTER TABLE %{identity}D RENAME CONSTRAINT %{oldname}I TO %{newname}I", 3,
+									"identity", ObjTypeObject,
+									new_objtree_for_qualname_id(RelationRelationId,
+																constform->conrelid),
+									"oldname", ObjTypeString, node->subname,
+									"newname", ObjTypeString, node->newname);
+				ReleaseSysCache(constrtup);
+			}
+			break;
+
+		case OBJECT_ATTRIBUTE:
+		case OBJECT_COLUMN:
+			relation = relation_open(address.objectId, AccessShareLock);
+			schemaId = RelationGetNamespace(relation);
+
+			if (node->renameType == OBJECT_ATTRIBUTE)
+				ret = new_objtree_VA("ALTER TYPE %{identity}D RENAME ATTRIBUTE %{colname}I", 2,
+									 "identity", ObjTypeObject,
+									 new_objtree_for_qualname(schemaId,
+															  node->relation->relname),
+									 "colname", ObjTypeString, node->subname);
+			else
+			{
+				ret = new_objtree_VA("ALTER %{objtype}s", 1,
+									 "objtype", ObjTypeString,
+									 stringify_objtype(node->relationType, false));
+
+				/* Composite types do not support IF EXISTS */
+				if (node->renameType == OBJECT_COLUMN)
+					append_string_object(ret, "%{if_exists}s",
+										 "if_exists",
+										 node->missing_ok ? "IF EXISTS" : "");
+
+				append_object_object(ret, "%{identity}D",
+									 new_objtree_for_qualname(schemaId,
+															  node->relation->relname));
+				append_string_object(ret, "RENAME COLUMN %{colname}I",
+									 "colname", node->subname);
+			}
+
+			append_string_object(ret, "TO %{newname}I", "newname",
+								 node->newname);
+
+			if (node->renameType == OBJECT_ATTRIBUTE)
+				append_object_object(ret, "%{cascade}s",
+									 new_objtree_VA("CASCADE", 1,
+													"present", ObjTypeBool,
+													node->behavior == DROP_CASCADE));
+
+			relation_close(relation, AccessShareLock);
+			break;
+
+		case OBJECT_AGGREGATE:
+		case OBJECT_FUNCTION:
+		case OBJECT_ROUTINE:
+			{
+				char	   *ident;
+				HeapTuple	proctup;
+				Form_pg_proc procform;
+				List	   *identity;
+
+				Assert(IsA(node->object, ObjectWithArgs));
+				identity = ((ObjectWithArgs *) node->object)->objname;
+
+				proctup = SearchSysCache1(PROCOID,
+										  ObjectIdGetDatum(address.objectId));
+				if (!HeapTupleIsValid(proctup))
+					elog(ERROR, "cache lookup failed for procedure with OID %u",
+						 address.objectId);
+				procform = (Form_pg_proc) GETSTRUCT(proctup);
+
+				/* XXX does this work for ordered-set aggregates? */
+				ident = psprintf("%s%s",
+								 quote_qualified_identifier(get_namespace_name(procform->pronamespace),
+															strVal(llast(identity))),
+								 format_procedure_args(address.objectId, true));
+
+				ret = new_objtree_VA("ALTER %{objtype}s %{identity}s RENAME TO %{newname}I", 3,
+									 "objtype", ObjTypeString,
+									 stringify_objtype(node->renameType, false),
+									 "identity", ObjTypeString, ident,
+									 "newname", ObjTypeString, node->newname);
+
+				ReleaseSysCache(proctup);
+			}
+			break;
+
+		case OBJECT_OPCLASS:
+			{
+				HeapTuple	opcTup;
+				Form_pg_opclass opcForm;
+				List	   *oldnames;
+				char	   *schemaname;
+				char	   *opcname;
+
+				opcTup = SearchSysCache1(CLAOID, ObjectIdGetDatum(address.objectId));
+				if (!HeapTupleIsValid(opcTup))
+					elog(ERROR, "cache lookup failed for opclass with OID %u",
+						 address.objectId);
+
+				opcForm = (Form_pg_opclass) GETSTRUCT(opcTup);
+
+				oldnames = list_copy_tail((List *) node->object, 1);
+
+				/* Deconstruct the name list */
+				DeconstructQualifiedName(oldnames, &schemaname, &opcname);
+
+				ret = new_objtree_VA("ALTER %{objtype}s %{identity}D USING %{index_method}s RENAME TO %{newname}I", 4,
+									 "objtype", ObjTypeString,
+									 stringify_objtype(node->renameType, false),
+									 "identity", ObjTypeObject,
+									 new_objtree_for_qualname(opcForm->opcnamespace,
+															  opcname),
+									 "index_method", ObjTypeString,
+									 get_am_name(opcForm->opcmethod),
+									 "newname", ObjTypeString, node->newname);
+
+				ReleaseSysCache(opcTup);
+			}
+			break;
+
+		case OBJECT_OPFAMILY:
+			{
+				HeapTuple	opfTup;
+				HeapTuple	amTup;
+				Form_pg_opfamily opfForm;
+				Form_pg_am	amForm;
+				List	   *oldnames;
+				char	   *schemaname;
+				char	   *opfname;
+
+				opfTup = SearchSysCache1(OPFAMILYOID, address.objectId);
+				if (!HeapTupleIsValid(opfTup))
+					elog(ERROR, "cache lookup failed for operator family with OID %u",
+						 address.objectId);
+				opfForm = (Form_pg_opfamily) GETSTRUCT(opfTup);
+
+				amTup = SearchSysCache1(AMOID, ObjectIdGetDatum(opfForm->opfmethod));
+				if (!HeapTupleIsValid(amTup))
+					elog(ERROR, "cache lookup failed for access method with OID %u",
+						 opfForm->opfmethod);
+
+				amForm = (Form_pg_am) GETSTRUCT(amTup);
+
+				oldnames = list_copy_tail((List *) node->object, 1);
+
+				/* Deconstruct the name list */
+				DeconstructQualifiedName(oldnames, &schemaname, &opfname);
+
+				ret = new_objtree_VA("ALTER %{objtype}s %{identity}D USING %{index_method}s RENAME TO %{newname}I", 4,
+									 "objtype", ObjTypeString,
+									 stringify_objtype(node->renameType, false),
+									 "identity", ObjTypeObject,
+									 new_objtree_for_qualname(opfForm->opfnamespace,
+															  opfname),
+									 "index_method", ObjTypeString,
+									 NameStr(amForm->amname),
+									 "newname", ObjTypeString, node->newname);
+
+				ReleaseSysCache(amTup);
+				ReleaseSysCache(opfTup);
+			}
+			break;
+
+		case OBJECT_SCHEMA:
+			ret = new_objtree_VA("ALTER SCHEMA %{identity}I RENAME TO %{newname}I", 2,
+								 "identity", ObjTypeString, node->subname,
+								 "newname", ObjTypeString, node->newname);
+			break;
+
+		case OBJECT_FDW:
+		case OBJECT_LANGUAGE:
+		case OBJECT_FOREIGN_SERVER:
+		case OBJECT_PUBLICATION:
+			ret = new_objtree_VA("ALTER %{objtype}s %{identity}s RENAME TO %{newname}I", 3,
+								 "objtype", ObjTypeString,
+								 stringify_objtype(node->renameType, false),
+								 "identity", ObjTypeString,
+								 strVal(castNode(String, node->object)),
+								 "newname", ObjTypeString, node->newname);
+			break;
+
+		case OBJECT_RULE:
+			{
+				HeapTuple	rewrTup;
+				Form_pg_rewrite rewrForm;
+				Relation	pg_rewrite;
+
+				pg_rewrite = relation_open(RewriteRelationId, AccessShareLock);
+				rewrTup = get_catalog_object_by_oid(pg_rewrite, Anum_pg_rewrite_oid, address.objectId);
+				rewrForm = (Form_pg_rewrite) GETSTRUCT(rewrTup);
+
+				ret = new_objtree_VA("ALTER RULE %{rulename}I ON %{identity}D RENAME TO %{newname}I", 3,
+									 "rulename", ObjTypeString, node->subname,
+									 "identity", ObjTypeObject,
+									 new_objtree_for_qualname_id(RelationRelationId,
+																 rewrForm->ev_class),
+									 "newname", ObjTypeString, node->newname);
+				relation_close(pg_rewrite, AccessShareLock);
+			}
+			break;
+
+		case OBJECT_TRIGGER:
+			{
+				HeapTuple	trigTup;
+				Form_pg_trigger trigForm;
+				Relation	pg_trigger;
+
+				pg_trigger = relation_open(TriggerRelationId, AccessShareLock);
+				trigTup = get_catalog_object_by_oid(pg_trigger, get_object_attnum_oid(address.classId), address.objectId);
+				trigForm = (Form_pg_trigger) GETSTRUCT(trigTup);
+
+				ret = new_objtree_VA("ALTER TRIGGER %{triggername}I ON %{identity}D RENAME TO %{newname}I", 3,
+									 "triggername", ObjTypeString, node->subname,
+									 "identity", ObjTypeObject,
+									 new_objtree_for_qualname_id(RelationRelationId,
+																 trigForm->tgrelid),
+									 "newname", ObjTypeString, node->newname);
+
+				relation_close(pg_trigger, AccessShareLock);
+			}
+			break;
+
+		case OBJECT_COLLATION:
+		case OBJECT_STATISTIC_EXT:
+		case OBJECT_TYPE:
+		case OBJECT_CONVERSION:
+		case OBJECT_DOMAIN:
+		case OBJECT_TSDICTIONARY:
+		case OBJECT_TSPARSER:
+		case OBJECT_TSTEMPLATE:
+		case OBJECT_TSCONFIGURATION:
+			{
+				HeapTuple	objTup;
+				Relation	catalog;
+				Datum		objnsp;
+				bool		isnull;
+				AttrNumber	Anum_namespace;
+				List	   *identity = castNode(List, node->object);
+
+				/* Obtain object tuple */
+				catalog = relation_open(address.classId, AccessShareLock);
+				objTup = get_catalog_object_by_oid(catalog, get_object_attnum_oid(address.classId), address.objectId);
+
+				/* Obtain namespace */
+				Anum_namespace = get_object_attnum_namespace(address.classId);
+				objnsp = heap_getattr(objTup, Anum_namespace,
+									  RelationGetDescr(catalog), &isnull);
+				if (isnull)
+					elog(ERROR, "invalid NULL namespace");
+
+				ret = new_objtree_VA("ALTER %{objtype}s %{identity}D RENAME TO %{newname}I", 3,
+									 "objtype", ObjTypeString,
+									 stringify_objtype(node->renameType, false),
+									 "identity", ObjTypeObject,
+									 new_objtree_for_qualname(DatumGetObjectId(objnsp),
+															  strVal(llast(identity))),
+									 "newname", ObjTypeString, node->newname);
+				relation_close(catalog, AccessShareLock);
+			}
+			break;
+
+		default:
+			elog(ERROR, "unsupported object type %d", node->renameType);
+	}
+
+	return ret;
+}
+
+/*
+ * Deparse a AlterObjectDependsStmt (ALTER ... DEPENDS ON ...).
+ *
+ * Verbose syntax
+ * ALTER INDEX %{identity}D %{no}s DEPENDS ON EXTENSION %{newname}I
+ */
+static ObjTree *
+deparse_AlterDependStmt(Oid objectId, Node *parsetree)
+{
+	AlterObjectDependsStmt *node = (AlterObjectDependsStmt *) parsetree;
+	ObjTree    *ret = NULL;
+
+	if (node->objectType == OBJECT_INDEX)
+	{
+		ObjTree    *qualified;
+		Relation	relation = relation_open(objectId, AccessShareLock);
+
+		qualified = new_objtree_for_qualname(relation->rd_rel->relnamespace,
+											 node->relation->relname);
+		relation_close(relation, AccessShareLock);
+
+		ret = new_objtree_VA("ALTER INDEX %{identity}D %{no}s DEPENDS ON EXTENSION %{newname}I", 3,
+							 "identity", ObjTypeObject, qualified,
+							 "no", ObjTypeString,
+							 node->remove ? "NO" : "",
+							 "newname", ObjTypeString, strVal(node->extname));
+	}
+	else
+		elog(LOG, "unrecognized node type in deparse command: %d",
+			 (int) nodeTag(parsetree));
+
+	return ret;
+}
+
+/*
+ * Deparse a RuleStmt (CREATE RULE).
+ *
+ * Given a rule OID and the parse tree that created it, return an ObjTree
+ * representing the rule command.
+ *
+ * Verbose syntax
+ * CREATE RULE %{or_replace}s %{identity}I AS ON %{event}s TO %{table}D
+ * %{where_clause}s DO %{instead}s %{actions:, }s
+ */
+static ObjTree *
+deparse_RuleStmt(Oid objectId, Node *parsetree)
+{
+	RuleStmt   *node = (RuleStmt *) parsetree;
+	ObjTree    *ret;
+	ObjTree    *tmp;
+	Relation	pg_rewrite;
+	Form_pg_rewrite rewrForm;
+	HeapTuple	rewrTup;
+	SysScanDesc scan;
+	ScanKeyData key;
+	Datum		ev_qual;
+	Datum		ev_actions;
+	bool		isnull;
+	char	   *qual;
+	List	   *actions;
+	List	   *list = NIL;
+	ListCell   *cell;
+	char	   *event_str;
+
+	pg_rewrite = table_open(RewriteRelationId, AccessShareLock);
+	ScanKeyInit(&key,
+				Anum_pg_rewrite_oid,
+				BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(objectId));
+
+	scan = systable_beginscan(pg_rewrite, RewriteOidIndexId, true,
+							  NULL, 1, &key);
+	rewrTup = systable_getnext(scan);
+	if (!HeapTupleIsValid(rewrTup))
+		elog(ERROR, "cache lookup failed for rewrite rule with OID %u",
+			 objectId);
+
+	rewrForm = (Form_pg_rewrite) GETSTRUCT(rewrTup);
+
+	event_str = node->event == CMD_SELECT ? "SELECT" :
+		node->event == CMD_UPDATE ? "UPDATE" :
+		node->event == CMD_DELETE ? "DELETE" :
+		node->event == CMD_INSERT ? "INSERT" : NULL;
+	Assert(event_str != NULL);
+
+	ev_qual = heap_getattr(rewrTup, Anum_pg_rewrite_ev_qual,
+						   RelationGetDescr(pg_rewrite), &isnull);
+	ev_actions = heap_getattr(rewrTup, Anum_pg_rewrite_ev_action,
+							  RelationGetDescr(pg_rewrite), &isnull);
+
+	pg_get_ruledef_detailed(ev_qual, ev_actions, &qual, &actions);
+
+	tmp = new_objtree("");
+	if (qual)
+		append_string_object(tmp, "WHERE %{clause}s", "clause", qual);
+	else
+	{
+		append_null_object(tmp, "WHERE %{clause}s");
+		append_not_present(tmp);
+	}
+
+	if (actions == NIL)
+		list = lappend(list, new_string_object("NOTHING"));
+	else
+	{
+		foreach(cell, actions)
+			list = lappend(list, new_string_object(lfirst(cell)));
+	}
+
+	ret = new_objtree_VA("CREATE RULE %{or_replace}s %{identity}I AS ON %{event}s TO %{table}D %{where_clause}s DO %{instead}s", 6,
+						 "or_replace", ObjTypeString,
+						 node->replace ? "OR REPLACE" : "",
+						 "identity", ObjTypeString, node->rulename,
+						 "event", ObjTypeString, event_str,
+						 "table", ObjTypeObject,
+						 new_objtree_for_qualname_id(RelationRelationId,
+													 rewrForm->ev_class),
+						 "where_clause", ObjTypeObject, tmp,
+						 "instead", ObjTypeString,
+						 node->instead ? "INSTEAD" : "ALSO");
+
+	if (list_length(list) > 1)
+		append_array_object(ret, "(%{actions:; }s)", list);
+	else
+		append_array_object(ret, "%{actions:; }s", list);
+
+	systable_endscan(scan);
+	table_close(pg_rewrite, AccessShareLock);
+
+	return ret;
+}
+
+/*
+ * Deparse a CreateTransformStmt (CREATE TRANSFORM).
+ *
+ * Given a transform OID and the parse tree that created it, return an ObjTree
+ * representing the CREATE TRANSFORM command.
+ *
+ * Verbose syntax
+ * CREATE %{or_replace}s TRANSFORM FOR %{typename}D LANGUAGE %{language}I
+ * ( FROM SQL WITH FUNCTION %{signature}s, TO SQL WITH FUNCTION
+ * %{signature_tof}s )
+ */
+static ObjTree *
+deparse_CreateTransformStmt(Oid objectId, Node *parsetree)
+{
+	CreateTransformStmt *node = (CreateTransformStmt *) parsetree;
+	ObjTree    *ret;
+	ObjTree    *signature;
+	HeapTuple	trfTup;
+	HeapTuple	langTup;
+	HeapTuple	procTup;
+	Form_pg_transform trfForm;
+	Form_pg_language langForm;
+	Form_pg_proc procForm;
+	int			i;
+
+	/* Get the pg_transform tuple */
+	trfTup = SearchSysCache1(TRFOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(trfTup))
+		elog(ERROR, "cache lookup failed for transform with OID %u",
+			 objectId);
+	trfForm = (Form_pg_transform) GETSTRUCT(trfTup);
+
+	/* Get the corresponding pg_language tuple */
+	langTup = SearchSysCache1(LANGOID, trfForm->trflang);
+	if (!HeapTupleIsValid(langTup))
+		elog(ERROR, "cache lookup failed for language with OID %u",
+			 trfForm->trflang);
+	langForm = (Form_pg_language) GETSTRUCT(langTup);
+
+	ret = new_objtree_VA("CREATE %{or_replace}s TRANSFORM FOR %{typename}D LANGUAGE %{language}I", 3,
+						 "or_replace", ObjTypeString,
+						 node->replace ? "OR REPLACE" : "",
+						 "typename", ObjTypeObject,
+						 new_objtree_for_qualname_id(TypeRelationId,
+													 trfForm->trftype),
+						 "language", ObjTypeString,
+						 NameStr(langForm->lanname));
+
+	/* Deparse the transform_element_list */
+	if (OidIsValid(trfForm->trffromsql))
+	{
+		List	   *params = NIL;
+
+		/* Get the pg_proc tuple for the FROM FUNCTION */
+		procTup = SearchSysCache1(PROCOID, trfForm->trffromsql);
+		if (!HeapTupleIsValid(procTup))
+			elog(ERROR, "cache lookup failed for function with OID %u",
+				 trfForm->trffromsql);
+		procForm = (Form_pg_proc) GETSTRUCT(procTup);
+
+		/*
+		 * CREATE TRANSFORM does not change function signature so we can use
+		 * catalog to get input type Oids.
+		 */
+		for (i = 0; i < procForm->pronargs; i++)
+		{
+			ObjTree    *param_obj;
+
+			param_obj = new_objtree_VA("%{type}T", 1,
+									  "type", ObjTypeObject,
+								 new_objtree_for_type(procForm->proargtypes.values[i], -1));
+			params = lappend(params, new_object_object(param_obj));
+		}
+
+		signature = new_objtree_VA("%{identity}D (%{arguments:, }s)", 2,
+								   "identity", ObjTypeObject,
+								   new_objtree_for_qualname(procForm->pronamespace,
+															NameStr(procForm->proname)),
+								   "arguments", ObjTypeArray, params);
+
+		append_object_object(ret, "(FROM SQL WITH FUNCTION %{signature}s",
+							 signature);
+		ReleaseSysCache(procTup);
+	}
+	if (OidIsValid(trfForm->trftosql))
+	{
+		List	   *params = NIL;
+
+		/* Append a ',' if trffromsql is present, else append '(' */
+		append_format_string(ret, OidIsValid(trfForm->trffromsql) ? "," : "(");
+
+		/* Get the pg_proc tuple for the TO FUNCTION */
+		procTup = SearchSysCache1(PROCOID, trfForm->trftosql);
+		if (!HeapTupleIsValid(procTup))
+			elog(ERROR, "cache lookup failed for function with OID %u",
+				 trfForm->trftosql);
+		procForm = (Form_pg_proc) GETSTRUCT(procTup);
+
+		/*
+		 * CREATE TRANSFORM does not change function signature so we can use
+		 * catalog to get input type Oids.
+		 */
+		for (i = 0; i < procForm->pronargs; i++)
+		{
+			ObjTree    *param_obj = new_objtree("");
+
+			param_obj = new_objtree_VA("%{type}T", 1,
+									  "type", ObjTypeObject,
+									  new_objtree_for_type(procForm->proargtypes.values[i], -1));
+			params = lappend(params, new_object_object(param_obj));
+		}
+
+		signature = new_objtree_VA("%{identity}D (%{arguments:, }s)", 2,
+								   "identity", ObjTypeObject,
+								   new_objtree_for_qualname(procForm->pronamespace,
+															NameStr(procForm->proname)),
+								   "arguments", ObjTypeArray, params);
+
+		append_object_object(ret, "TO SQL WITH FUNCTION %{signature_tof}s",
+							 signature);
+		ReleaseSysCache(procTup);
+	}
+
+	append_format_string(ret, ")");
+
+	ReleaseSysCache(langTup);
+	ReleaseSysCache(trfTup);
+	return ret;
+}
+
+/*
+ * Deparse a CommentStmt when it pertains to a constraint.
+ *
+ * Verbose syntax
+ * COMMENT ON CONSTRAINT %{identity}s ON [DOMAIN] %{parentobj}s IS %{comment}s
+ */
+static ObjTree *
+deparse_CommentOnConstraintSmt(Oid objectId, Node *parsetree)
+{
+	CommentStmt *node = (CommentStmt *) parsetree;
+	ObjTree    *ret;
+	HeapTuple	constrTup;
+	Form_pg_constraint constrForm;
+	ObjectAddress addr;
+
+	Assert(node->objtype == OBJECT_TABCONSTRAINT || node->objtype == OBJECT_DOMCONSTRAINT);
+
+	constrTup = SearchSysCache1(CONSTROID, objectId);
+	if (!HeapTupleIsValid(constrTup))
+		elog(ERROR, "cache lookup failed for constraint with OID %u", objectId);
+	constrForm = (Form_pg_constraint) GETSTRUCT(constrTup);
+
+	if (OidIsValid(constrForm->conrelid))
+		ObjectAddressSet(addr, RelationRelationId, constrForm->conrelid);
+	else
+		ObjectAddressSet(addr, TypeRelationId, constrForm->contypid);
+
+	ret = new_objtree_VA("COMMENT ON CONSTRAINT %{identity}s ON %{domain}s %{parentobj}s", 3,
+						 "identity", ObjTypeString, pstrdup(NameStr(constrForm->conname)),
+						 "domain", ObjTypeString,
+						 (node->objtype == OBJECT_DOMCONSTRAINT) ? "DOMAIN" : "",
+						 "parentobj", ObjTypeString,
+						 getObjectIdentity(&addr, false));
+
+	/* Add the comment clause */
+	append_literal_or_null(ret, "IS %{comment}s", node->comment);
+
+	ReleaseSysCache(constrTup);
+	return ret;
+}
+
+/*
+ * Deparse an CommentStmt (COMMENT ON ...).
+ *
+ * Given the object address and the parse tree that created it, return an
+ * ObjTree representing the comment command.
+ *
+ * Verbose syntax
+ * COMMENT ON %{objtype}s %{identity}s IS %{comment}s
+ */
+static ObjTree *
+deparse_CommentStmt(ObjectAddress address, Node *parsetree)
+{
+	CommentStmt *node = (CommentStmt *) parsetree;
+	ObjTree    *ret;
+	char	   *identity;
+
+	/* Comment on subscription is not supported */
+	if (node->objtype == OBJECT_SUBSCRIPTION)
+		return NULL;
+
+	/*
+	 * Constraints are sufficiently different that it is easier to handle them
+	 * separately.
+	 */
+	if (node->objtype == OBJECT_DOMCONSTRAINT ||
+		node->objtype == OBJECT_TABCONSTRAINT)
+	{
+		Assert(address.classId == ConstraintRelationId);
+		return deparse_CommentOnConstraintSmt(address.objectId, parsetree);
+	}
+
+	ret = new_objtree_VA("COMMENT ON %{objtype}s", 1,
+						 "objtype", ObjTypeString,
+						 (char *) stringify_objtype(node->objtype, false));
+
+	/*
+	 * Add the object identity clause.  For zero argument aggregates we need
+	 * to add the (*) bit; in all other cases we can just use
+	 * getObjectIdentity.
+	 *
+	 * XXX shouldn't we instead fix the object identities for zero-argument
+	 * aggregates?
+	 */
+	if (node->objtype == OBJECT_AGGREGATE)
+	{
+		HeapTuple	procTup;
+		Form_pg_proc procForm;
+
+		procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(address.objectId));
+		if (!HeapTupleIsValid(procTup))
+			elog(ERROR, "cache lookup failed for procedure with OID %u",
+				 address.objectId);
+		procForm = (Form_pg_proc) GETSTRUCT(procTup);
+		if (procForm->pronargs == 0)
+			identity = psprintf("%s(*)",
+								quote_qualified_identifier(get_namespace_name(procForm->pronamespace),
+														   NameStr(procForm->proname)));
+		else
+			identity = getObjectIdentity(&address, false);
+		ReleaseSysCache(procTup);
+	}
+	else
+		identity = getObjectIdentity(&address, false);
+
+	append_string_object(ret, "%{identity}s", "identity", identity);
+
+	/* Add the comment clause; can be either NULL or a quoted literal. */
+	append_literal_or_null(ret, "IS %{comment}s", node->comment);
+
+	return ret;
+}
+
+/*
+ * Deparse a SECURITY LABEL command.
+ *
+ * Verbose syntax
+ * SECURITY LABEL FOR %{provider}s ON %{object_type_name}s %{identity}s IS %{label}s
+ */
+static ObjTree *
+deparse_SecLabelStmt(CollectedCommand *cmd)
+{
+	ObjTree	   *ret;
+	SecLabelStmt *node = (SecLabelStmt *) cmd->parsetree;
+
+	/* Don't deparse sql commands generated while creating extension */
+	if (cmd->in_extension)
+		return NULL;
+
+	Assert(cmd->d.seclabel.provider);
+
+	ret = new_objtree_VA("SECURITY LABEL FOR %{provider}s ON %{objtype}s %{identity}s", 3,
+						 "provider", ObjTypeString, cmd->d.seclabel.provider,
+						 "objtype", ObjTypeString, stringify_objtype(node->objtype, false),
+						 "identity", ObjTypeString, getObjectIdentity(&(cmd->d.seclabel.address), false));
+
+	/* Add the label clause; can be either NULL or a quoted literal. */
+	append_literal_or_null(ret, "IS %{label}s", node->label);
+
+	return ret;
+}
+
+/*
+ * Deparse a CreateAmStmt (CREATE ACCESS METHOD).
+ *
+ * Given an access method OID and the parse tree that created it, return an
+ * ObjTree representing the CREATE ACCESS METHOD command.
+ *
+ * Verbose syntax
+ * CREATE ACCESS METHOD %{identity}I TYPE %{am_type}s HANDLER %{handler}D
+ */
+static ObjTree *
+deparse_CreateAmStmt(Oid objectId, Node *parsetree)
+{
+	ObjTree    *ret;
+	HeapTuple	amTup;
+	Form_pg_am	amForm;
+	char	   *amtype;
+
+	amTup = SearchSysCache1(AMOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(amTup))
+		elog(ERROR, "cache lookup failed for access method with OID %u",
+			 objectId);
+	amForm = (Form_pg_am) GETSTRUCT(amTup);
+
+	switch (amForm->amtype)
+	{
+		case 'i':
+			amtype = "INDEX";
+			break;
+		case 't':
+			amtype = "TABLE";
+			break;
+		default:
+			elog(ERROR, "invalid type %c for access method", amForm->amtype);
+	}
+
+	ret = new_objtree_VA("CREATE ACCESS METHOD %{identity}I TYPE %{am_type}s HANDLER %{handler}D", 3,
+						 "identity", ObjTypeString,
+						 NameStr(amForm->amname),
+						 "am_type", ObjTypeString, amtype,
+						 "handler", ObjTypeObject,
+						 new_objtree_for_qualname_id(ProcedureRelationId,
+													 amForm->amhandler));
+
+	ReleaseSysCache(amTup);
+
+	return ret;
+}
+
+/*
+ * Deparse the publication column list.
+ *
+ * Given a tuple of pg_publication_rel, return an objTree that represent the
+ * column names.
+ */
+static ObjTree *
+deparse_PublicationRelationColumnList(HeapTuple pubreltup)
+{
+	bool		isnull;
+	List	   *collist = NIL;
+	ObjTree	   *columnlist;
+	Datum		attrsdatum;
+
+	attrsdatum = SysCacheGetAttr(PUBLICATIONRELMAP, pubreltup,
+								 Anum_pg_publication_rel_prattrs,
+								 &isnull);
+
+	columnlist = new_objtree("");
+	if (!isnull)
+	{
+		Form_pg_publication_rel pubrel;
+		ArrayType  *arr;
+		int			nelems;
+		int16	   *elems;
+
+		arr = DatumGetArrayTypeP(attrsdatum);
+		nelems = ARR_DIMS(arr)[0];
+		elems = (int16 *) ARR_DATA_PTR(arr);
+
+		pubrel = (Form_pg_publication_rel) GETSTRUCT(pubreltup);
+
+		for (int i = 0; i < nelems; i++)
+		{
+			char *colname = get_attname(pubrel->prrelid, elems[i], false);
+			collist = lappend(collist, new_string_object(colname));
+		}
+
+		append_array_object(columnlist, "(%{cols:, }s)", collist);
+	}
+	else
+		append_not_present(columnlist);
+
+	return columnlist;
+}
+
+/*
+ * Deparse the publication where clause.
+ *
+ * Given a tuple of pg_publication_rel, return a objTree that represent the
+ * publication where clause.
+ */
+static ObjTree *
+deparse_PublicationRelationWhereClause(HeapTuple pubreltup)
+{
+	Datum					qualdatum;
+	ObjTree				   *whereclause;
+	bool					isnull;
+
+	qualdatum = SysCacheGetAttr(PUBLICATIONRELMAP, pubreltup,
+								Anum_pg_publication_rel_prqual, &isnull);
+
+	whereclause = new_objtree("");
+	if (!isnull)
+	{
+		Form_pg_publication_rel pubrel;
+		Node				   *qualnode;
+		List				   *context;
+		char				   *qualstr;
+		Oid						relid;
+
+		pubrel = (Form_pg_publication_rel) GETSTRUCT(pubreltup);
+		relid = pubrel->prrelid;
+
+		context = deparse_context_for(get_rel_name(relid), relid);
+		qualnode = stringToNode(TextDatumGetCString(qualdatum));
+		qualstr = deparse_expression(qualnode, context, false, false);
+
+		append_string_object(whereclause, "WHERE %{where}s", "where", qualstr);
+	}
+	else
+		append_not_present(whereclause);
+
+	return whereclause;
+}
+
+/*
+ * Subroutine for CREATE PUBLICATION deparsing.
+ *
+ * Deal with all the publication table information including the where clause
+ * and column list.
+ */
+static List *
+deparse_PublicationRelationDefs(Oid puboid)
+{
+	Relation	pubrelsrel;
+	ScanKeyData scankey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *reldefs = NIL;
+
+	pubrelsrel = table_open(PublicationRelRelationId, AccessShareLock);
+
+	ScanKeyInit(&scankey,
+				Anum_pg_publication_rel_prpubid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(puboid));
+
+	scan = systable_beginscan(pubrelsrel, PublicationRelPrpubidIndexId,
+							  true, NULL, 1, &scankey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_publication_rel pubrel;
+		Oid						relid;
+		ObjTree				   *columnlist;
+		ObjTree				   *whereclause;
+		ObjTree				   *reldef;
+
+		pubrel = (Form_pg_publication_rel) GETSTRUCT(tup);
+		relid = pubrel->prrelid;
+
+		reldef = new_objtree_VA("%{tablename}D", 1,
+								"tablename", ObjTypeObject,
+								 new_objtree_for_qualname_id(RelationRelationId, relid));
+
+		columnlist = deparse_PublicationRelationColumnList(tup);
+		append_object_object(reldef, "%{column_list}s", columnlist);
+
+		whereclause = deparse_PublicationRelationWhereClause(tup);
+		append_object_object(reldef, "%{where_clause}s", whereclause);
+
+		reldefs = lappend(reldefs, new_object_object(reldef));
+	}
+
+	systable_endscan(scan);
+	table_close(pubrelsrel, AccessShareLock);
+
+	return reldefs;
+}
+
+/*
+ * Deparse a CreatePublicationStmt (CREATE PUBLICATION).
+ *
+ * Given an publication OID and the parse tree that created it, return an
+ * ObjTree representing the CREATE PUBLICATION command.
+ *
+ * Verbose syntax
+ * CREATE PUBLICATION %{identity}I %{for_tables}s %{for_schemas}s %{with_clause}s
+ * OR
+ * CREATE PUBLICATION %{identity}I FOR ALL TABLES %{with_clause}s
+ */
+static ObjTree *
+deparse_CreatePublicationStmt(Oid objectId, Node *parsetree)
+{
+	CreatePublicationStmt *node = (CreatePublicationStmt *) parsetree;
+	ObjTree    *createPub;
+	ObjTree    *tmp;
+	HeapTuple	pubTup;
+	Form_pg_publication	pubForm;
+	List	   *list = NIL;
+	ListCell   *cell;
+
+	pubTup = SearchSysCache1(PUBLICATIONOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(pubTup))
+		elog(ERROR, "cache lookup failed for access method with OID %u",
+			 objectId);
+	pubForm = (Form_pg_publication) GETSTRUCT(pubTup);
+
+	createPub = new_objtree_VA("CREATE PUBLICATION %{identity}s", 1,
+							   "identity", ObjTypeString,
+							   NameStr(pubForm->pubname));
+
+	if (node->for_all_tables)
+		append_format_string(createPub, "FOR ALL TABLES");
+	else
+	{
+		List	   *oldschemaids;
+		StringInfoData for_schemas;
+
+		/* FOR TABLES t1,t2,... */
+		tmp = new_objtree("FOR TABLE");
+
+		list = deparse_PublicationRelationDefs(objectId);
+		if (list != NIL)
+			append_array_object(tmp, "%{tables:, }s", list);
+		else
+			append_not_present(tmp);
+
+		append_object_object(createPub, "%{for_tables}s", tmp);
+
+		/* FOR TABLES IN SCHEMA s1,s2,... */
+		initStringInfo(&for_schemas);
+		if (list != NIL)
+			appendStringInfoString(&for_schemas, ", ");
+		else
+			appendStringInfoString(&for_schemas, "FOR ");
+		appendStringInfoString(&for_schemas, "TABLES IN SCHEMA");
+
+		tmp = new_objtree(for_schemas.data);
+		list = NIL;
+		oldschemaids = GetPublicationSchemas(pubForm->oid);
+		foreach(cell, oldschemaids)
+		{
+			Oid		schemaid = lfirst_oid(cell);
+			list = lappend(list, new_string_object(get_namespace_name(schemaid)));
+		}
+
+		if (list != NIL)
+			append_array_object(tmp, "%{schemas:, }I", list);
+		else
+			append_not_present(tmp);
+
+		append_object_object(createPub, "%{for_schemas}s", tmp);
+	}
+
+	/* WITH clause */
+	tmp = new_objtree("WITH");
+
+	list = NIL;
+	foreach(cell, node->options)
+	{
+		ObjTree    *tmp_obj;
+		DefElem    *opt = (DefElem *) lfirst(cell);
+
+		tmp_obj = deparse_DefElem(opt, false);
+		list = lappend(list, new_object_object(tmp_obj));
+	}
+
+	if (list != NIL)
+		append_array_object(tmp, "(%{with:, }s)", list);
+	else
+		append_not_present(tmp);
+
+	append_object_object(createPub, "%{with_clause}s", tmp);
+
+	ReleaseSysCache(pubTup);
+
+	return createPub;
+}
+
+/*
+ * Deparse a AlterPublicationStmt (ALTER PUBLICATION).
+ *
+ * Given an publication relation OID or publication schema OID and the parse
+ * tree that added it, return an ObjTree representing the ALTER PUBLICATION
+ * command.
+ *
+ * Note that only ALTER PUBLICATION ADD/SET should be deparsed here, ALTER
+ * PUBLICATION DROP is deparsed in different places.
+ *
+ * XXX ALTER PUBLICATION SET publication_object is converted to ALTER
+ * PUBLICATION ADD/DROP.
+ *
+ * Verbose syntax
+ * ALTER PUBLICATION %{identity}I %{add_object}s
+ * OR
+ * ALTER PUBLICATION %{identity}I %{set_options}s
+ */
+static ObjTree *
+deparse_AlterPublicationAddStmt(ObjectAddress object, Node *parsetree)
+{
+	char	   *pubname;
+	ObjTree	   *alterpub;
+	ObjTree	   *addobject = NULL;
+	ObjTree	   *setoption = NULL;
+	AlterPublicationStmt *node = (AlterPublicationStmt *) parsetree;
+
+	switch (object.classId)
+	{
+		/* ADD TABLE */
+		case PublicationRelRelationId:
+			{
+				ObjTree	   *whereclause;
+				ObjTree	   *columnlist;
+				Form_pg_publication_rel pubrelform;
+				Oid			relid;
+				HeapTuple	tup;
+
+				tup = SearchSysCache1(PUBLICATIONREL,
+									  ObjectIdGetDatum(object.objectId));
+
+				if (!HeapTupleIsValid(tup))
+					elog(ERROR, "cache lookup failed for publication table %u",
+						 object.objectId);
+
+				pubrelform = (Form_pg_publication_rel) GETSTRUCT(tup);
+				relid = pubrelform->prrelid;
+
+				addobject = new_objtree_VA("ADD TABLE %{tablename}D", 1,
+										   "tablename", ObjTypeObject,
+										   new_objtree_for_qualname_id(RelationRelationId, relid));
+
+				columnlist = deparse_PublicationRelationColumnList(tup);
+				append_object_object(addobject, "%{column_list}s", columnlist);
+
+				whereclause = deparse_PublicationRelationWhereClause(tup);
+				append_object_object(addobject, "%{where_clause}s", whereclause);
+
+				ReleaseSysCache(tup);
+			}
+			break;
+
+		/* ADD TABLES IN SCHEMA */
+		case PublicationNamespaceRelationId:
+			{
+				Form_pg_publication_namespace pubnspform;
+				HeapTuple	tup;
+
+				tup = SearchSysCache1(PUBLICATIONNAMESPACE,
+									  ObjectIdGetDatum(object.objectId));
+
+				if (!HeapTupleIsValid(tup))
+					elog(ERROR, "cache lookup failed for publication schema %u",
+						 object.objectId);
+
+				pubnspform = (Form_pg_publication_namespace) GETSTRUCT(tup);
+
+				addobject = new_objtree_VA("ADD TABLES IN SCHEMA %{schema}I", 1,
+										   "schema", ObjTypeString,
+										   get_namespace_name(pubnspform->pnnspid));
+
+				ReleaseSysCache(tup);
+			}
+			break;
+
+		/* SET option */
+		case PublicationRelationId:
+			{
+				List	   *optionlist = NIL;
+				ListCell   *cell;
+
+				Assert(node->options != NIL);
+
+				foreach(cell, node->options)
+				{
+					ObjTree    *tmp_obj;
+					DefElem    *opt = (DefElem *) lfirst(cell);
+
+					tmp_obj = deparse_DefElem(opt, false);
+					optionlist = lappend(optionlist, new_object_object(tmp_obj));
+				}
+
+				setoption = new_objtree_VA("SET (%{options:, }s)", 1,
+										   "options", ObjTypeArray,
+										   optionlist);
+			}
+			break;
+
+		default:
+			Assert(false);
+			break;
+	}
+
+	pubname = pstrdup(node->pubname);
+
+	alterpub = new_objtree_VA("ALTER PUBLICATION %{identity}s", 1,
+							  "identity", ObjTypeString, pubname);
+
+	Assert(addobject || setoption);
+
+	if (addobject)
+		append_object_object(alterpub, "%{add_object}s", addobject);
+	else
+		append_object_object(alterpub, "%{set_options}s", setoption);
+
+	return alterpub;
+}
+
+/*
+ * Handle deparsing of ALTER PUBLICATION DROP commands.
+ *
+ * Verbose syntax
+ * ALTER PUBLICATION %{identity}I %{drop_object}s
+ */
+char *
+deparse_AlterPublicationDropStmt(SQLDropObject *obj)
+{
+	ObjTree	   *alterpub;
+	ObjTree	   *drop_object = NULL;
+	char		objname[NAMEDATALEN];
+	char		pubname[NAMEDATALEN];
+	Jsonb	   *jsonb;
+	char	   *command;
+	StringInfoData str;
+
+	if (sscanf(obj->objidentity, "%s in publication %s", objname, pubname) != 2)
+		elog(ERROR, "could not parse ALTER PUBLICATION command \"%s\"",
+			 obj->objidentity);
+
+	switch (getObjectClass(&obj->address))
+	{
+		/* DROP TABLE */
+		case OCLASS_PUBLICATION_REL:
+			drop_object = new_objtree_VA("DROP TABLE %{tablename}s", 1,
+										 "tablename", ObjTypeString, objname);
+			break;
+
+		/* DROP TABLES IN SCHEMA */
+		case OCLASS_PUBLICATION_NAMESPACE:
+			drop_object = new_objtree_VA("DROP TABLES IN SCHEMA %{schemaname}s", 1,
+										 "schemaname", ObjTypeString, objname);
+			break;
+
+		default:
+			Assert(false);
+			break;
+	}
+
+	alterpub = new_objtree_VA("ALTER PUBLICATION %{identity}s", 1,
+							  "identity", ObjTypeString, pubname);
+
+	Assert(drop_object);
+
+	append_object_object(alterpub, "%{drop_object}s", drop_object);
+
+	initStringInfo(&str);
+	jsonb = objtree_to_jsonb(alterpub);
+	command = JsonbToCString(&str, &jsonb->root, JSONB_ESTIMATED_LEN);
+
+	return command;
+}
+
+/*
  * Handle deparsing of simple commands.
  *
  * This function should cover all cases handled in ProcessUtilitySlow.
@@ -3483,14 +9844,160 @@ deparse_simple_command(CollectedCommand *cmd)
 	/* This switch needs to handle everything that ProcessUtilitySlow does */
 	switch (nodeTag(parsetree))
 	{
+		case T_AlterCollationStmt:
+			return deparse_AlterCollation(objectId, parsetree);
+
+		case T_AlterDomainStmt:
+			return deparse_AlterDomainStmt(objectId, parsetree,
+										   cmd->d.simple.secondaryObject);
+
+		case T_AlterEnumStmt:
+			return deparse_AlterEnumStmt(objectId, parsetree);
+
+		case T_AlterExtensionContentsStmt:
+			return deparse_AlterExtensionContentsStmt(objectId, parsetree,
+													  cmd->d.simple.secondaryObject);
+
+		case T_AlterExtensionStmt:
+			return deparse_AlterExtensionStmt(objectId, parsetree);
+
+		case T_AlterFdwStmt:
+			return deparse_AlterFdwStmt(objectId, parsetree);
+
+		case T_AlterForeignServerStmt:
+			return deparse_AlterForeignServerStmt(objectId, parsetree);
+
+		case T_AlterFunctionStmt:
+			return deparse_AlterFunction(objectId, parsetree);
+
+		case T_AlterObjectDependsStmt:
+			return deparse_AlterDependStmt(objectId, parsetree);
+
+		case T_AlterObjectSchemaStmt:
+			return deparse_AlterObjectSchemaStmt(cmd->d.simple.address,
+												 parsetree,
+												 cmd->d.simple.secondaryObject);
+
+		case T_AlterOperatorStmt:
+			return deparse_AlterOperatorStmt(objectId, parsetree);
+
+		case T_AlterOwnerStmt:
+			return deparse_AlterOwnerStmt(cmd->d.simple.address, parsetree);
+
+		case T_AlterPolicyStmt:
+			return deparse_AlterPolicyStmt(objectId, parsetree);
+
+		case T_AlterSeqStmt:
+			return deparse_AlterSeqStmt(objectId, parsetree);
+
+		case T_AlterStatsStmt:
+			return deparse_AlterStatsStmt(objectId, parsetree);
+
+		case T_AlterTSDictionaryStmt:
+			return deparse_AlterTSDictionaryStmt(objectId, parsetree);
+
+		case T_AlterTypeStmt:
+			return deparse_AlterTypeSetStmt(objectId, parsetree);
+
+		case T_AlterUserMappingStmt:
+			return deparse_AlterUserMappingStmt(objectId, parsetree);
+
+		case T_CommentStmt:
+			return deparse_CommentStmt(cmd->d.simple.address, parsetree);
+
+		case T_CompositeTypeStmt:
+			return deparse_CompositeTypeStmt(objectId, parsetree);
+
+		case T_CreateAmStmt:
+			return deparse_CreateAmStmt(objectId, parsetree);
+
+		case T_CreateCastStmt:
+			return deparse_CreateCastStmt(objectId, parsetree);
+
+		case T_CreateConversionStmt:
+			return deparse_CreateConversion(objectId, parsetree);
+
+		case T_CreateDomainStmt:
+			return deparse_CreateDomain(objectId, parsetree);
+
+		case T_CreateEnumStmt:	/* CREATE TYPE AS ENUM */
+			return deparse_CreateEnumStmt(objectId, parsetree);
+
+		case T_CreateExtensionStmt:
+			return deparse_CreateExtensionStmt(objectId, parsetree);
+
+		case T_CreateFdwStmt:
+			return deparse_CreateFdwStmt(objectId, parsetree);
+
+		case T_CreateForeignServerStmt:
+			return deparse_CreateForeignServerStmt(objectId, parsetree);
+
+		case T_CreateFunctionStmt:
+			return deparse_CreateFunction(objectId, parsetree);
+
+		case T_CreateOpFamilyStmt:
+			return deparse_CreateOpFamily(objectId, parsetree);
+
+		case T_CreatePLangStmt:
+			return deparse_CreateLangStmt(objectId, parsetree);
+
+		case T_CreatePolicyStmt:
+			return deparse_CreatePolicyStmt(objectId, parsetree);
+
+		case T_CreateRangeStmt: /* CREATE TYPE AS RANGE */
+			return deparse_CreateRangeStmt(objectId, parsetree);
+
+		case T_CreateSchemaStmt:
+			return deparse_CreateSchemaStmt(objectId, parsetree);
+
 		case T_CreateSeqStmt:
 			return deparse_CreateSeqStmt(objectId, parsetree);
+
+		case T_CreateStatsStmt:
+			return deparse_CreateStatisticsStmt(objectId, parsetree);
 
 		case T_CreateStmt:
 			return deparse_CreateStmt(objectId, parsetree);
 
+		case T_CreateForeignTableStmt:
+			return deparse_CreateForeignTableStmt(objectId, parsetree);
+
+		case T_CreateTableAsStmt:	/* CREATE MATERIALIZED VIEW */
+			return deparse_CreateTableAsStmt_vanilla(objectId, parsetree);
+
+		case T_CreateTransformStmt:
+			return deparse_CreateTransformStmt(objectId, parsetree);
+
+		case T_CreateTrigStmt:
+			return deparse_CreateTrigStmt(objectId, parsetree);
+
+		case T_CreateUserMappingStmt:
+			return deparse_CreateUserMappingStmt(objectId, parsetree);
+
+		case T_DefineStmt:
+			return deparse_DefineStmt(objectId, parsetree,
+									  cmd->d.simple.secondaryObject);
+
 		case T_IndexStmt:
 			return deparse_IndexStmt(objectId, parsetree);
+
+		case T_RefreshMatViewStmt:
+			return deparse_RefreshMatViewStmt(objectId, parsetree);
+
+		case T_RenameStmt:
+			return deparse_RenameStmt(cmd->d.simple.address, parsetree);
+
+		case T_RuleStmt:
+			return deparse_RuleStmt(objectId, parsetree);
+
+		case T_ViewStmt:		/* CREATE VIEW */
+			return deparse_ViewStmt(objectId, parsetree);
+
+		case T_CreatePublicationStmt:
+			return deparse_CreatePublicationStmt(objectId, parsetree);
+
+		case T_AlterPublicationStmt:
+			return deparse_AlterPublicationAddStmt(cmd->d.simple.address, parsetree);
 
 		default:
 			elog(LOG, "unrecognized node type in deparse command: %d",
@@ -3550,8 +10057,26 @@ deparse_utility_command(CollectedCommand *cmd, bool verbose_mode)
 		case SCT_AlterTable:
 			tree = deparse_AlterRelation(cmd);
 			break;
+		case SCT_Grant:
+			tree = deparse_GrantStmt(cmd);
+			break;
 		case SCT_CreateTableAs:
 			tree = deparse_CreateTableAsStmt(cmd);
+			break;
+		case SCT_AlterOpFamily:
+			tree = deparse_AlterOpFamily(cmd);
+			break;
+		case SCT_CreateOpClass:
+			tree = deparse_CreateOpClassStmt(cmd);
+			break;
+		case SCT_AlterDefaultPrivileges:
+			tree = deparse_AlterDefaultPrivilegesStmt(cmd);
+			break;
+		case SCT_AlterTSConfig:
+			tree = deparse_AlterTSConfigurationStmt(cmd);
+			break;
+		case SCT_SecurityLabel:
+			tree = deparse_SecLabelStmt(cmd);
 			break;
 		default:
 			elog(ERROR, "unexpected deparse node type %d", cmd->type);

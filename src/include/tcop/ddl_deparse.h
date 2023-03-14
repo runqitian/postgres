@@ -12,11 +12,13 @@
 #ifndef DDL_DEPARSE_H
 #define DDL_DEPARSE_H
 
+#include "commands/event_trigger.h"
 #include "tcop/deparse_utility.h"
 
 extern char *deparse_utility_command(CollectedCommand *cmd, bool verbose_mode);
 extern char *deparse_ddl_json_to_string(char *jsonb);
 extern char *deparse_drop_command(const char *objidentity, const char *objecttype,
 								  DropBehavior behavior);
+extern char * deparse_AlterPublicationDropStmt(SQLDropObject *obj);
 
 #endif							/* DDL_DEPARSE_H */
