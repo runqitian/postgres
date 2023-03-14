@@ -21,6 +21,15 @@
 #include "catalog/pg_publication_d.h"
 #include "nodes/pg_list.h"
 
+/* Publication trigger events */
+#define PUB_TRIG_EVENT1 "ddl_command_end"
+#define PUB_TRIG_EVENT2 "ddl_command_start"
+#define PUB_TRIG_EVENT3 "table_rewrite"
+#define PUB_TRIG_EVENT4 "table_init_write"
+
+/* Publication event trigger prefix */
+#define PUB_EVENT_TRIG_PREFIX "pg_deparse_trig_%s_%u"
+
 /* ----------------
  *		pg_publication definition.  cpp turns this into
  *		typedef struct FormData_pg_publication
@@ -54,6 +63,12 @@ CATALOG(pg_publication,6104,PublicationRelationId)
 
 	/* true if partition changes are published using root schema */
 	bool		pubviaroot;
+
+	/* true if all supported ddls are published */
+	bool		pubddl_all;
+
+	/* true if table ddls are published */
+	bool		pubddl_table;
 } FormData_pg_publication;
 
 /* ----------------
@@ -72,6 +87,8 @@ typedef struct PublicationActions
 	bool		pubupdate;
 	bool		pubdelete;
 	bool		pubtruncate;
+	bool		pubddl_all;
+	bool		pubddl_table;
 } PublicationActions;
 
 typedef struct PublicationDesc

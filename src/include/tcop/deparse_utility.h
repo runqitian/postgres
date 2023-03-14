@@ -65,6 +65,7 @@ typedef struct CollectedCommand
 		{
 			Oid			objectId;
 			Oid			classId;
+			bool		rewrite;
 			List	   *subcmds;
 		}			alterTable;
 

@@ -94,6 +94,10 @@ extern void EventTriggerDDLCommandEnd(Node *parsetree);
 extern void EventTriggerSQLDrop(Node *parsetree);
 extern void EventTriggerTableRewrite(Node *parsetree, Oid tableOid, int reason);
 
+extern void EventTriggerTableInitWriteStart(Node *parsetree);
+extern void EventTriggerTableInitWrite(Node *parsetree, ObjectAddress address);
+extern void EventTriggerTableInitWriteEnd(ObjectAddress address);
+
 extern bool EventTriggerBeginCompleteQuery(void);
 extern void EventTriggerEndCompleteQuery(void);
 extern bool trackDroppedObjectsNeeded(void);
@@ -110,7 +114,12 @@ extern void EventTriggerCollectSimpleCommand(ObjectAddress address,
 extern void EventTriggerAlterTableStart(Node *parsetree);
 extern void EventTriggerAlterTableRelid(Oid objectId);
 extern void EventTriggerCollectAlterTableSubcmd(Node *subcmd,
-												ObjectAddress address);
+												ObjectAddress address,
+												bool rewrite);
+
+extern void EventTriggerAlterTypeStart(AlterTableCmd *subcmd, Relation rel);
+extern void EventTriggerAlterTypeEnd(Node *subcmd, ObjectAddress address,
+									 bool rewrite);
 extern void EventTriggerAlterTableEnd(void);
 
 extern void EventTriggerCollectGrant(InternalGrant *istmt);
@@ -120,6 +129,9 @@ extern void EventTriggerCollectAlterOpFam(AlterOpFamilyStmt *stmt,
 extern void EventTriggerCollectCreateOpClass(CreateOpClassStmt *stmt,
 											 Oid opcoid, List *operators,
 											 List *procedures);
+extern void EventTriggerCollectCreatePublication(CreatePublicationStmt *stmt,
+												 Oid pubid, List *relations,
+												 List *schemas);
 extern void EventTriggerCollectAlterTSConfig(AlterTSConfigurationStmt *stmt,
 											 Oid cfgId, Oid *dictIds, int ndicts);
 extern void EventTriggerCollectAlterDefPrivs(AlterDefaultPrivilegesStmt *stmt);

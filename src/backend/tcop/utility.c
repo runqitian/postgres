@@ -1669,8 +1669,11 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateTableAsStmt:
+				EventTriggerTableInitWriteStart(parsetree);
 				address = ExecCreateTableAs(pstate, (CreateTableAsStmt *) parsetree,
 											params, queryEnv, qc);
+				EventTriggerTableInitWriteEnd(address);
+				commandCollected = true;
 				break;
 
 			case T_RefreshMatViewStmt:
@@ -2256,6 +2259,8 @@ stringify_objtype(ObjectType objtype, bool isgrant)
 			return "POLICY";
 		case OBJECT_PROCEDURE:
 			return "PROCEDURE";
+		case OBJECT_PUBLICATION:
+			return "PUBLICATION";
 		case OBJECT_ROLE:
 			return "ROLE";
 		case OBJECT_ROUTINE:
@@ -2268,6 +2273,8 @@ stringify_objtype(ObjectType objtype, bool isgrant)
 			return "SEQUENCE";
 		case OBJECT_STATISTIC_EXT:
 			return "STATISTICS";
+		case OBJECT_SUBSCRIPTION:
+			return "SUBSCRIPTION";
 		case OBJECT_TABLE:
 			return "TABLE";
 		case OBJECT_TABLESPACE:
@@ -2296,10 +2303,8 @@ stringify_objtype(ObjectType objtype, bool isgrant)
 		case OBJECT_DEFACL:
 		case OBJECT_DOMCONSTRAINT:
 		case OBJECT_PARAMETER_ACL:
-		case OBJECT_PUBLICATION:
 		case OBJECT_PUBLICATION_NAMESPACE:
 		case OBJECT_PUBLICATION_REL:
-		case OBJECT_SUBSCRIPTION:
 		case OBJECT_TABCONSTRAINT:
 		case OBJECT_TRANSFORM:
 			elog(ERROR, "unsupported object type %d", objtype);
