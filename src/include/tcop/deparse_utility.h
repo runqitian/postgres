@@ -30,7 +30,8 @@ typedef enum CollectedCommandType
 	SCT_AlterDefaultPrivileges,
 	SCT_CreateOpClass,
 	SCT_AlterTSConfig,
-	SCT_SecurityLabel
+	SCT_SecurityLabel,
+	SCT_CreateTableAs
 } CollectedCommandType;
 
 /*
@@ -40,6 +41,7 @@ typedef struct CollectedATSubcmd
 {
 	ObjectAddress address;		/* affected column, constraint, index, ... */
 	Node	   *parsetree;
+	char	   *usingexpr;
 } CollectedATSubcmd;
 
 typedef struct CollectedCommand
@@ -108,6 +110,13 @@ typedef struct CollectedCommand
 			ObjectAddress address;
 			char		 *provider;
 		}			seclabel;
+
+		/* CREATE TABLE AS */
+		struct
+		{
+			ObjectAddress address;
+			Node		 *real_create;
+		}			ctas;
 	}			d;
 
 	struct CollectedCommand *parent;	/* when nested */

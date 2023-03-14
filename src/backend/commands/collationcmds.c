@@ -156,8 +156,8 @@ DefineCollation(ParseState *pstate, List *names, List *parameters,
 			elog(ERROR, "cache lookup failed for collation %u", collid);
 
 		/*
-		 * Make from existing collationid available to callers for statements such as
-		 * CREATE COLLATION any_name FROM any_name
+		 * Make from existing collationid available to callers for statements
+		 * such as CREATE COLLATION any_name FROM existing_collation.
 		 */
 		if (from_existing_collid && OidIsValid(collid))
 			ObjectAddressSet(*from_existing_collid, CollationRelationId, collid);

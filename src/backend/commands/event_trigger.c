@@ -1856,6 +1856,7 @@ pg_event_trigger_ddl_commands(PG_FUNCTION_ARGS)
 			case SCT_CreateOpClass:
 			case SCT_AlterTSConfig:
 			case SCT_SecurityLabel:
+			case SCT_CreateTableAs:
 				{
 					char	   *identity;
 					char	   *type;
@@ -1875,6 +1876,8 @@ pg_event_trigger_ddl_commands(PG_FUNCTION_ARGS)
 						addr = cmd->d.atscfg.address;
 					else if (cmd->type == SCT_SecurityLabel)
 						addr = cmd->d.seclabel.address;
+					else if (cmd->type == SCT_CreateTableAs)
+						addr = cmd->d.ctas.address;
 
 					/*
 					 * If an object was dropped in the same command we may end
