@@ -49,6 +49,7 @@ typedef struct CollectedCommand
 	CollectedCommandType type;
 
 	bool		in_extension;
+	char	   *role;
 	Node	   *parsetree;
 
 	union

@@ -665,6 +665,7 @@ typedef struct _SubscriptionInfo
 	char	   *suborigin;
 	char	   *subsynccommit;
 	char	   *subpublications;
+	char	   *submatchddlowner;
 } SubscriptionInfo;
 
 /*

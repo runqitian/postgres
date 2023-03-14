@@ -172,7 +172,7 @@ static ObjElem *new_object_object(ObjTree *value);
 static ObjTree *new_objtree_VA(char *fmt, int numobjs,...);
 static ObjTree *new_objtree(char *fmt);
 static ObjElem *new_string_object(char *value);
-static JsonbValue *objtree_to_jsonb_rec(ObjTree *tree, JsonbParseState *state);
+static JsonbValue *objtree_to_jsonb_rec(ObjTree *tree, JsonbParseState *state, char *owner);
 static void pg_get_indexdef_detailed(Oid indexrelid,
 									 char **index_am,
 									 char **definition,
@@ -993,14 +993,39 @@ objtree_fmt_to_jsonb_element(JsonbParseState *state, ObjTree *tree)
 }
 
 /*
- * Create a JSONB representation from an ObjTree.
+ * Process the role string into the output parse state.
+ */
+static void
+role_to_jsonb_element(JsonbParseState *state, char *owner)
+{
+	JsonbValue	key;
+	JsonbValue	val;
+
+	if (owner == NULL)
+		return;
+
+	/* Push the key first */
+	key.type = jbvString;
+	key.val.string.val = "myowner";
+	key.val.string.len = strlen(key.val.string.val);
+	pushJsonbValue(&state, WJB_KEY, &key);
+
+	/* Then process the role string */
+	val.type = jbvString;
+	val.val.string.len = strlen(owner);
+	val.val.string.val = owner;
+	pushJsonbValue(&state, WJB_VALUE, &val);
+}
+
+/*
+ * Create a JSONB representation from an ObjTree and its owner (if given).
  */
 static Jsonb *
-objtree_to_jsonb(ObjTree *tree)
+objtree_to_jsonb(ObjTree *tree, char *owner)
 {
 	JsonbValue *value;
 
-	value = objtree_to_jsonb_rec(tree, NULL);
+	value = objtree_to_jsonb_rec(tree, NULL, owner);
 	return JsonbValueToJsonb(value);
 }
 
@@ -1052,7 +1077,7 @@ objtree_to_jsonb_element(JsonbParseState *state, ObjElem *object,
 
 		case ObjTypeObject:
 			/* Recursively add the object into the existing parse state */
-			objtree_to_jsonb_rec(object->value.object, state);
+			objtree_to_jsonb_rec(object->value.object, state, NULL);
 			break;
 
 		case ObjTypeArray:
@@ -1080,12 +1105,13 @@ objtree_to_jsonb_element(JsonbParseState *state, ObjElem *object,
  * Recursive helper for objtree_to_jsonb.
  */
 static JsonbValue *
-objtree_to_jsonb_rec(ObjTree *tree, JsonbParseState *state)
+objtree_to_jsonb_rec(ObjTree *tree, JsonbParseState *state, char *owner)
 {
 	slist_iter	iter;
 
 	pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
 
+	role_to_jsonb_element(state, owner);
 	objtree_fmt_to_jsonb_element(state, tree);
 
 	slist_foreach(iter, &tree->params)
@@ -3711,7 +3737,7 @@ deparse_drop_command(const char *objidentity, const char *objecttype,
 							"present", ObjTypeBool, behavior == DROP_CASCADE);
 	append_object_object(stmt, "%{cascade}s", tmp_obj);
 
-	jsonb = objtree_to_jsonb(stmt);
+	jsonb = objtree_to_jsonb(stmt, NULL /* Owner/role can be skipped for drop command */);
 	command = JsonbToCString(&str, &jsonb->root, JSONB_ESTIMATED_LEN);
 
 	return command;
@@ -9816,7 +9842,7 @@ deparse_AlterPublicationDropStmt(SQLDropObject *obj)
 	append_object_object(alterpub, "%{drop_object}s", drop_object);
 
 	initStringInfo(&str);
-	jsonb = objtree_to_jsonb(alterpub);
+	jsonb = objtree_to_jsonb(alterpub, NULL /* Owner/role can be skipped for drop command */);
 	command = JsonbToCString(&str, &jsonb->root, JSONB_ESTIMATED_LEN);
 
 	return command;
@@ -9828,7 +9854,7 @@ deparse_AlterPublicationDropStmt(SQLDropObject *obj)
  * This function should cover all cases handled in ProcessUtilitySlow.
  */
 static ObjTree *
-deparse_simple_command(CollectedCommand *cmd)
+deparse_simple_command(CollectedCommand *cmd, bool *include_owner)
 {
 	Oid			objectId;
 	Node	   *parsetree;
@@ -9845,64 +9871,83 @@ deparse_simple_command(CollectedCommand *cmd)
 	switch (nodeTag(parsetree))
 	{
 		case T_AlterCollationStmt:
+			*include_owner = false;
 			return deparse_AlterCollation(objectId, parsetree);
 
 		case T_AlterDomainStmt:
+			*include_owner = false;
 			return deparse_AlterDomainStmt(objectId, parsetree,
 										   cmd->d.simple.secondaryObject);
 
 		case T_AlterEnumStmt:
+			*include_owner = false;
 			return deparse_AlterEnumStmt(objectId, parsetree);
 
 		case T_AlterExtensionContentsStmt:
+			*include_owner = false;
 			return deparse_AlterExtensionContentsStmt(objectId, parsetree,
 													  cmd->d.simple.secondaryObject);
 
 		case T_AlterExtensionStmt:
+			*include_owner = false;
 			return deparse_AlterExtensionStmt(objectId, parsetree);
 
 		case T_AlterFdwStmt:
+			*include_owner = false;
 			return deparse_AlterFdwStmt(objectId, parsetree);
 
 		case T_AlterForeignServerStmt:
+			*include_owner = false;
 			return deparse_AlterForeignServerStmt(objectId, parsetree);
 
 		case T_AlterFunctionStmt:
+			*include_owner = false;
 			return deparse_AlterFunction(objectId, parsetree);
 
 		case T_AlterObjectDependsStmt:
+			*include_owner = false;
 			return deparse_AlterDependStmt(objectId, parsetree);
 
 		case T_AlterObjectSchemaStmt:
+			*include_owner = false;
 			return deparse_AlterObjectSchemaStmt(cmd->d.simple.address,
 												 parsetree,
 												 cmd->d.simple.secondaryObject);
 
 		case T_AlterOperatorStmt:
+			*include_owner = false;
 			return deparse_AlterOperatorStmt(objectId, parsetree);
 
 		case T_AlterOwnerStmt:
+			*include_owner = false;
 			return deparse_AlterOwnerStmt(cmd->d.simple.address, parsetree);
 
 		case T_AlterPolicyStmt:
+			*include_owner = false;
 			return deparse_AlterPolicyStmt(objectId, parsetree);
 
 		case T_AlterSeqStmt:
+			*include_owner = false;
 			return deparse_AlterSeqStmt(objectId, parsetree);
 
 		case T_AlterStatsStmt:
+			*include_owner = false;
 			return deparse_AlterStatsStmt(objectId, parsetree);
 
 		case T_AlterTSDictionaryStmt:
+			*include_owner = false;
 			return deparse_AlterTSDictionaryStmt(objectId, parsetree);
 
 		case T_AlterTypeStmt:
+			*include_owner = false;
 			return deparse_AlterTypeSetStmt(objectId, parsetree);
 
 		case T_AlterUserMappingStmt:
+			*include_owner = false;
 			return deparse_AlterUserMappingStmt(objectId, parsetree);
 
 		case T_CommentStmt:
+			*include_owner = false;
 			return deparse_CommentStmt(cmd->d.simple.address, parsetree);
 
 		case T_CompositeTypeStmt:
@@ -9982,9 +10027,11 @@ deparse_simple_command(CollectedCommand *cmd)
 			return deparse_IndexStmt(objectId, parsetree);
 
 		case T_RefreshMatViewStmt:
+			*include_owner = false;
 			return deparse_RefreshMatViewStmt(objectId, parsetree);
 
 		case T_RenameStmt:
+			*include_owner = false;
 			return deparse_RenameStmt(cmd->d.simple.address, parsetree);
 
 		case T_RuleStmt:
@@ -10009,9 +10056,15 @@ deparse_simple_command(CollectedCommand *cmd)
 
 /*
  * Workhorse to deparse a CollectedCommand.
+ *
+ * include_owner indicates if the owner/role of the command should be
+ * included in the deparsed Json output. It is set to false for any commands
+ * that don't CREATE database objects (ALTER commands for example), this is
+ * to avoid encoding and sending the owner to downstream for replay as it is
+ * unnecessary for such commands.
  */
 char *
-deparse_utility_command(CollectedCommand *cmd, bool verbose_mode)
+deparse_utility_command(CollectedCommand *cmd, bool include_owner, bool verbose_mode)
 {
 	OverrideSearchPath *overridePath;
 	MemoryContext oldcxt;
@@ -10052,30 +10105,36 @@ deparse_utility_command(CollectedCommand *cmd, bool verbose_mode)
 	switch (cmd->type)
 	{
 		case SCT_Simple:
-			tree = deparse_simple_command(cmd);
+			tree = deparse_simple_command(cmd, &include_owner);
 			break;
 		case SCT_AlterTable:
 			tree = deparse_AlterRelation(cmd);
+			include_owner = false;
 			break;
 		case SCT_Grant:
 			tree = deparse_GrantStmt(cmd);
+			include_owner = false;
 			break;
 		case SCT_CreateTableAs:
 			tree = deparse_CreateTableAsStmt(cmd);
 			break;
 		case SCT_AlterOpFamily:
+			include_owner = false;
 			tree = deparse_AlterOpFamily(cmd);
 			break;
 		case SCT_CreateOpClass:
 			tree = deparse_CreateOpClassStmt(cmd);
 			break;
 		case SCT_AlterDefaultPrivileges:
+			include_owner = false;
 			tree = deparse_AlterDefaultPrivilegesStmt(cmd);
 			break;
 		case SCT_AlterTSConfig:
+			include_owner = false;
 			tree = deparse_AlterTSConfigurationStmt(cmd);
 			break;
 		case SCT_SecurityLabel:
+			include_owner = false;
 			tree = deparse_SecLabelStmt(cmd);
 			break;
 		default:
@@ -10088,7 +10147,8 @@ deparse_utility_command(CollectedCommand *cmd, bool verbose_mode)
 	{
 		Jsonb	   *jsonb;
 
-		jsonb = objtree_to_jsonb(tree);
+		jsonb = include_owner ? objtree_to_jsonb(tree, cmd->role) :
+								objtree_to_jsonb(tree, NULL);
 		command = JsonbToCString(&str, &jsonb->root, JSONB_ESTIMATED_LEN);
 	}
 
@@ -10114,7 +10174,7 @@ ddl_deparse_to_json(PG_FUNCTION_ARGS)
 	CollectedCommand *cmd = (CollectedCommand *) PG_GETARG_POINTER(0);
 	char	   *command;
 
-	command = deparse_utility_command(cmd, true);
+	command = deparse_utility_command(cmd, false, true);
 
 	if (command)
 		PG_RETURN_TEXT_P(cstring_to_text(command));

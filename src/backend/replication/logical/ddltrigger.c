@@ -122,7 +122,7 @@ publication_deparse_table_rewrite(PG_FUNCTION_ARGS)
 	if (relpersist != RELPERSISTENCE_TEMP)
 	{
 		/* Deparse the DDL command and WAL log it to allow decoding of the same. */
-		json_string = deparse_utility_command(cmd, false);
+		json_string = deparse_utility_command(cmd, true, false);
 
 		if (json_string != NULL)
 			LogLogicalDDLMessage("deparse", cmd->d.alterTable.objectId, DCT_TableAlter,
@@ -200,7 +200,7 @@ publication_deparse_ddl_command_end(PG_FUNCTION_ARGS)
 			 * Deparse the DDL command and WAL log it to allow decoding of the
 			 * same.
 			 */
-			json_string = deparse_utility_command(cmd, false);
+			json_string = deparse_utility_command(cmd, true, false);
 
 			if (json_string != NULL)
 				LogLogicalDDLMessage("deparse", relid, type, json_string,
@@ -355,7 +355,7 @@ publication_deparse_table_init_write(PG_FUNCTION_ARGS)
 		return PointerGetDatum(NULL);
 
 	/* Deparse the DDL command and WAL log it to allow decoding of the same. */
-	json_string = deparse_utility_command(cmd, false);
+	json_string = deparse_utility_command(cmd, true, false);
 
 	if (json_string != NULL)
 		LogLogicalDDLMessage("deparse", cmd->d.simple.address.objectId, DCT_SimpleCmd,

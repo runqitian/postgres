@@ -3349,20 +3349,32 @@ apply_handle_ddl(StringInfo s)
 	const char *prefix = NULL;
 	char	   *message = NULL;
 	char	   *ddl_command;
+	char	   *owner;
 	Size		sz;
 	List	   *parsetree_list;
 	ListCell   *parsetree_item;
 	DestReceiver *receiver;
 	MemoryContext oldcontext;
 	const char *save_debug_query_string = debug_query_string;
+	int			save_nestlevel = 0;
 
 	message = logicalrep_read_ddl(s, &lsn, &prefix, &sz);
 
 	/* Make sure we are in a transaction command */
 	begin_replication_step();
 
-	ddl_command = deparse_ddl_json_to_string(message);
+	ddl_command = deparse_ddl_json_to_string(message, &owner);
 	debug_query_string = ddl_command;
+
+	if (MySubscription->matchddlowner && owner)
+	{
+		/*
+		 * Set the current role to the owner that executed the command on the
+		 * publication server.
+		 */
+		save_nestlevel = NewGUCNestLevel();
+		SetConfigOption("role", owner, PGC_INTERNAL, PGC_S_OVERRIDE);
+	}
 
 	/* DestNone for logical replication */
 	receiver = CreateDestReceiver(DestNone);
@@ -3459,6 +3471,14 @@ apply_handle_ddl(StringInfo s)
 
 		/* Now we may drop the per-parsetree context, if one was created. */
 		MemoryContextDelete(per_parsetree_context);
+	}
+
+	/*
+	 * Restore the GUC variables we set above.
+	 */
+	if (save_nestlevel > 0)
+	{
+		AtEOXact_GUC(true, save_nestlevel);
 	}
 
 	debug_query_string = save_debug_query_string;

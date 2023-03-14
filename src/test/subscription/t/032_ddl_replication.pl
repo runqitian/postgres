@@ -457,6 +457,23 @@ is($result, qq(42), 'CREATE TABLE OF replicated');
 $node_publisher->safe_psql('postgres', "DROP TABLE tmp");
 $node_publisher->safe_psql('postgres', "DROP TYPE int42 cascade");
 
+# Test owner of replicated table on subscriber matches the owner on publisher when
+# the match_ddl_owner subscription option is enabled
+$node_publisher->safe_psql('postgres', "CREATE ROLE ddl_replication_user LOGIN SUPERUSER;");
+
+$node_subscriber->safe_psql('postgres', "CREATE ROLE ddl_replication_user LOGIN SUPERUSER;");
+$node_subscriber->safe_psql('postgres', "ALTER SUBSCRIPTION mysub SET (match_ddl_owner = true);");
+
+$node_publisher->safe_psql('postgres', "SET SESSION AUTHORIZATION 'ddl_replication_user'; CREATE TABLE tmp (a int, b varchar);");
+$node_publisher->wait_for_catchup('mysub');
+
+$result = $node_subscriber->safe_psql('postgres', "SELECT tableowner from pg_catalog.pg_tables where tablename = 'tmp';");
+is($result, qq(ddl_replication_user), 'Owner of tmp is ddl_replication_user');
+$node_publisher->safe_psql('postgres', "DROP TABLE tmp");
+# reset match_ddl_owner
+$node_subscriber->safe_psql('postgres', "ALTER SUBSCRIPTION mysub SET (match_ddl_owner = false);");
+
+
 pass "DDL replication tests passed:";
 
 $node_subscriber->stop;
