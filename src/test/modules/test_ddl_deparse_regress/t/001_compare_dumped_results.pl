@@ -135,11 +135,25 @@ sub create_deparse_testing_resources_on_pub_node {
         END;
         \$\$;
 
+        create or replace function deparse_create_table_as_to_json()
+            returns event_trigger language plpgsql as
+        \$\$
+        declare
+            deparsed_json text;
+        begin
+            deparsed_json = deparse_table_init_write();
+            insert into deparsed_ddls(tag, object_identity, ddl) values (NULL, NULL, deparsed_json);
+        end;
+        \$\$;
+
         create event trigger ddl_deparse_trig
         on ddl_command_end execute procedure deparse_to_json();
 
         create event trigger ddl_drops_deparse_trig
         on sql_drop execute procedure deparse_drops_to_json();
+
+        create event trigger ddl_create_table_as_deparse_trig
+        on table_init_write execute procedure deparse_create_table_as_to_json();
 
         commit;
     "
@@ -153,8 +167,10 @@ sub clean_deparse_testing_resources_on_pub_node {
     $node -> safe_psql($dbname,q(
         drop event trigger ddl_deparse_trig;
         drop event trigger ddl_drops_deparse_trig;
+        drop event trigger ddl_create_table_as_deparse_trig;
         drop function deparse_to_json();
         drop function deparse_drops_to_json();
+        drop function deparse_create_table_as_to_json();
         drop table deparsed_ddls;
         DROP EXTENSION test_ddl_deparse_regress;
     ));

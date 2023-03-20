@@ -34,7 +34,8 @@ tests += {
       'aggregate',
       'create_table',
       'constraints',
-      'alter_table'
+      'alter_table',
+      'create_table_as'
     ],
   },
   'tap': {

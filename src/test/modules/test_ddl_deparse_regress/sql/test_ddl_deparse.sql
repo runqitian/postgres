@@ -21,3 +21,18 @@ $$;
 
 CREATE EVENT TRIGGER test_ddl_deparse
 ON ddl_command_end EXECUTE PROCEDURE test_ddl_deparse();
+
+CREATE OR REPLACE FUNCTION test_deparse_create_table_as()
+	RETURNS event_trigger LANGUAGE plpgsql AS
+$$
+DECLARE
+	deparsed_json text;
+BEGIN
+	deparsed_json = deparse_table_init_write();
+	RAISE NOTICE 'deparsed json: %', deparsed_json;
+	RAISE NOTICE 're-formed command: %', pg_catalog.ddl_deparse_expand_command(deparsed_json);
+END;
+$$;
+
+CREATE EVENT TRIGGER test_deparse_create_table_as
+ON table_init_write EXECUTE PROCEDURE test_deparse_create_table_as();

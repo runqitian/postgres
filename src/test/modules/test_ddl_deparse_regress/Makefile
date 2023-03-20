@@ -23,7 +23,8 @@ REGRESS = test_ddl_deparse \
 	aggregate \
 	create_table \
 	constraints \
-	alter_table
+	alter_table \
+	create_table_as
 
 export REGRESS
 

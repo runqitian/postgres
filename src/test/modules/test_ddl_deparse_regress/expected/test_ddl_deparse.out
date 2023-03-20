@@ -18,3 +18,26 @@ END;
 $$;
 CREATE EVENT TRIGGER test_ddl_deparse
 ON ddl_command_end EXECUTE PROCEDURE test_ddl_deparse();
+CREATE OR REPLACE FUNCTION test_deparse_create_table_as()
+	RETURNS event_trigger LANGUAGE plpgsql AS
+$$
+DECLARE
+	deparsed_json text;
+BEGIN
+	deparsed_json = deparse_table_init_write();
+	RAISE NOTICE 'deparsed json: %', deparsed_json;
+	RAISE NOTICE 're-formed command: %', pg_catalog.ddl_deparse_expand_command(deparsed_json);
+END;
+$$;
+NOTICE:  deparsed json: {"fmt": "CREATE %{or_replace}s FUNCTION %{signature}s RETURNS %{return_type}s %{transform_type}s LANGUAGE %{language}I %{window}s %{volatility}s %{parallel_safety}s %{leakproof}s %{strict}s %{security_definer}s %{cost}s %{rows}s %{support}s AS %{definition}L", "cost": {"fmt": "COST %{cost}n", "cost": 100}, "rows": {"fmt": "ROWS", "present": false}, "strict": "CALLED ON NULL INPUT", "window": "", "support": {"fmt": "SUPPORT %{name}s", "present": false}, "language": "plpgsql", "leakproof": "", "signature": {"fmt": "%{identity}D ( )", "identity": {"objname": "test_deparse_create_table_as", "schemaname": "public"}}, "definition": "\nDECLARE\n\tdeparsed_json text;\nBEGIN\n\tdeparsed_json = deparse_table_init_write();\n\tRAISE NOTICE 'deparsed json: %', deparsed_json;\n\tRAISE NOTICE 're-formed command: %', pg_catalog.ddl_deparse_expand_command(deparsed_json);\nEND;\n", "or_replace": "OR REPLACE", "volatility": "VOLATILE", "return_type": {"fmt": "%{setof}s %{rettype}T", "setof": "", "rettype": {"typmod": "", "typarray": false, "typename": "event_trigger", "schemaname": "pg_catalog"}, "return_form": "plain"}, "transform_type": {"fmt": "TRANSFORM", "present": false}, "parallel_safety": "PARALLEL UNSAFE", "security_definer": "SECURITY INVOKER"}
+NOTICE:  re-formed command: CREATE OR REPLACE FUNCTION public.test_deparse_create_table_as ( ) RETURNS  pg_catalog.event_trigger  LANGUAGE plpgsql  VOLATILE PARALLEL UNSAFE  CALLED ON NULL INPUT SECURITY INVOKER COST 100   AS $$
+DECLARE
+	deparsed_json text;
+BEGIN
+	deparsed_json = deparse_table_init_write();
+	RAISE NOTICE 'deparsed json: %', deparsed_json;
+	RAISE NOTICE 're-formed command: %', pg_catalog.ddl_deparse_expand_command(deparsed_json);
+END;
+$$
+CREATE EVENT TRIGGER test_deparse_create_table_as
+ON table_init_write EXECUTE PROCEDURE test_deparse_create_table_as();

@@ -7,3 +7,8 @@ CREATE FUNCTION deparse_drop_ddl(IN objidentity text,
     IN objecttype text)
   RETURNS text IMMUTABLE STRICT
   AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION deparse_table_init_write()
+  RETURNS text STRICT
+  AS 'MODULE_PATHNAME' LANGUAGE C;
+  
