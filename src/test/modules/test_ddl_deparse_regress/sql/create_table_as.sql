@@ -52,27 +52,27 @@ CREATE TABLE test_with_data AS SELECT * FROM test_create_table_as_base WITH DATA
 CREATE TABLE test_with_no_data AS TABLE test_create_table_as_base WITH NO DATA;
 
 -- complex statements
--- CREATE UNLOGGED TABLE test_complex_statement1
---     USING heap
---     WITH (vacuum_index_cleanup = ON, autovacuum_vacuum_scale_factor = 0.2, vacuum_truncate = true)
---     TABLESPACE pg_default
---     AS SELECT name, id FROM test_create_table_as_base
---     WITH NO DATA;
+CREATE UNLOGGED TABLE test_complex_statement1
+    USING heap
+    WITH (vacuum_index_cleanup = ON, autovacuum_vacuum_scale_factor = 0.2, vacuum_truncate = true)
+    TABLESPACE pg_default
+    AS SELECT name, id FROM test_create_table_as_base
+    WITH NO DATA;
 
--- CREATE TABLE test_complex_statement2
---     USING heap
---     WITHOUT OIDS
---     TABLESPACE pg_default
---     AS TABLE test_create_table_as_base
---     WITH NO DATA;
+CREATE TABLE test_complex_statement2
+    USING heap
+    WITHOUT OIDS
+    TABLESPACE pg_default
+    AS TABLE test_create_table_as_base
+    WITH NO DATA;
 
--- CREATE TABLE test_complex_statement3
---     (id, name, dob)
---     USING heap
---     WITH (vacuum_index_cleanup = ON, autovacuum_vacuum_scale_factor = 0.2, vacuum_truncate = true)
---     TABLESPACE pg_default
---     AS VALUES (1, 'value1', '2023-01-01'::date), (1, 'value1', '2023-01-02'::date)
---     WITH DATA;
+CREATE TABLE test_complex_statement3
+    (id, name, dob)
+    USING heap
+    WITH (vacuum_index_cleanup = ON, autovacuum_vacuum_scale_factor = 0.2, vacuum_truncate = true)
+    TABLESPACE pg_default
+    AS VALUES (1, 'value1', '2023-01-01'::date), (1, 'value1', '2023-01-02'::date)
+    WITH DATA;
 
 
 

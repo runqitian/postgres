@@ -29,13 +29,14 @@ tests += {
   'regress': {
     'sql': [
       'test_ddl_deparse',
-      'create_extension',
       'create_schema',
       'aggregate',
       'create_table',
       'constraints',
       'alter_table',
-      'create_table_as'
+      'create_table_as',
+      'index',
+      'sequence'
     ],
   },
   'tap': {

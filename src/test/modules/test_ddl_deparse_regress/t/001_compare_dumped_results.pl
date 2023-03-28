@@ -181,6 +181,8 @@ sub create_prerequisite_resources {
     my $dbname = $_[1];
     my $user = $_[2];
     $node -> safe_psql($dbname, "CREATE ROLE ${user} SUPERUSER LOGIN CREATEDB;");
+    $node -> safe_psql($dbname, "SET allow_in_place_tablespaces = true; CREATE TABLESPACE ddl_testing_tablespace LOCATION '';");
+    $node -> safe_psql($dbname, "SET allow_in_place_tablespaces = true; CREATE TABLESPACE ddl_testing_tablespace_backup LOCATION '';");
 }
 
 sub trim {
